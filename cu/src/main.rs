@@ -51,6 +51,8 @@ enum Cmd {
     Stop { name: String },
     /// Delete an instance. Final: the boot disk goes with it.
     Rm { name: String },
+    /// Admin: abandon tracking on a retired node. Does not erase host disks.
+    Forget { id: InstanceId },
     /// Admin: nodes
     #[command(subcommand)]
     Node(NodeCmd),
@@ -157,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Project(ProjectCmd::Ls) => {
             let v: Vec<serde_json::Value> = c.call(Method::GET, "/v1/projects", None).await?;
             for x in v {
-                println!("{}", x["name"].as_str().unwrap_or("?"));
+                println!("{}:{}", x["owner"].as_str().unwrap_or("?"), x["name"].as_str().unwrap_or("?"));
             }
         }
         Cmd::Project(ProjectCmd::Create { name }) => {
@@ -192,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Rm { name } => {
             let _: () = c.call(Method::DELETE, &format!("/v1/projects/{p}/instances/{name}"), None).await?;
             println!("deleting {name}");
+        }
+        Cmd::Forget { id } => {
+            let _: () = c.call(Method::POST, &format!("/v1/instances/{id}/forget"), None).await?;
+            println!("forgot {id}; VM and disk cleanup on the retired host is manual");
         }
         Cmd::Node(NodeCmd::Ls) => {
             let v: Vec<Node> = c.call(Method::GET, "/v1/nodes", None).await?;

@@ -1,7 +1,7 @@
 //! Bearer tokens, stored as SHA-256 hashes. Admins issue them with `kiln token`.
 
 use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
+use axum::http::{HeaderMap, request::Parts};
 use copper_api::Role;
 use rand::RngCore;
 use rusqlite::Connection;
@@ -17,12 +17,14 @@ pub fn hash(token: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-pub fn issue_token(conn: &Connection, user: &str, role: Role) -> anyhow::Result<String> {
-    let user = db::ensure_user(conn, user, role)?;
+pub fn issue_token(conn: &Connection, user: &str, role: Option<Role>) -> anyhow::Result<String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let user = db::ensure_user(&tx, user, role)?;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     let token = format!("cu_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-    db::insert_token(conn, &hash(&token), user.id)?;
+    db::insert_token(&tx, &hash(&token), user.id)?;
+    tx.commit()?;
     Ok(token)
 }
 
@@ -39,9 +41,14 @@ impl FromRequestParts<AppState> for Auth {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Error> {
-        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).ok_or_else(Error::unauthorized)?;
-        let token = header.strip_prefix("Bearer ").ok_or_else(Error::unauthorized)?;
+        let token = bearer(&parts.headers)?;
         let conn = state.db.lock().unwrap();
         db::user_by_token_hash(&conn, &hash(token))?.map(Auth).ok_or_else(Error::unauthorized)
     }
+}
+
+pub fn bearer(headers: &HeaderMap) -> crate::error::Result<&str> {
+    headers.get("authorization").and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer ")).filter(|token| !token.is_empty())
+        .ok_or_else(Error::unauthorized)
 }

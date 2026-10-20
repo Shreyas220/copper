@@ -1,8 +1,8 @@
 //! Choose a node for a new instance, or refuse immediately.
 //!
 //! Free capacity is a node's reported capacity minus the sum of every instance
-//! still assigned to it (anything not desired-absent counts, whether running
-//! or stopped, because a stopped instance still owns its disk and may start).
+//! still assigned to it, including pending deletions. Resources are only
+//! released when the agent confirms deletion and the row is removed.
 
 use copper_api::*;
 use rusqlite::Connection;
@@ -31,9 +31,6 @@ pub fn choose(conn: &Connection, spec: &InstanceSpec) -> Result<NodeRow> {
 pub fn free_capacity(conn: &Connection, node: &NodeRow) -> Result<Capacity> {
     let mut free = node.capacity.clone();
     for inst in db::list_instances_on_node(conn, node.id)? {
-        if inst.desired == DesiredState::Absent {
-            continue;
-        }
         free.vcpus = free.vcpus.saturating_sub(inst.spec.vcpus);
         free.memory_mb = free.memory_mb.saturating_sub(inst.spec.memory_mb);
         free.disk_gb = free.disk_gb.saturating_sub(inst.spec.boot_disk.size_gb);

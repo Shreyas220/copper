@@ -7,6 +7,10 @@ mod hv;
 mod identity;
 mod reconcile;
 mod state;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -16,7 +20,7 @@ use anyhow::Context;
 use clap::Parser;
 use copper_api::*;
 
-use crate::client::Kiln;
+use crate::client::{Kiln, NodeClient};
 use crate::reconcile::Reconciler;
 
 #[derive(Parser, Debug, Clone)]
@@ -41,13 +45,35 @@ struct Opts {
     /// Memory kept back for the host, in MB.
     #[arg(long, env = "INGOT_RESERVE_MEMORY_MB", default_value_t = 4096)]
     reserve_memory_mb: u64,
+    /// Disk space kept back for the host, in GiB.
+    #[arg(long, env = "INGOT_RESERVE_DISK_GB", default_value_t = 0)]
+    reserve_disk_gb: u64,
 }
 
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "ingot stopped");
+            if client::terminal(&e) || e.downcast_ref::<Retired>().is_some() {
+                std::process::ExitCode::from(78)
+            } else { std::process::ExitCode::FAILURE }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Retired;
+impl std::fmt::Display for Retired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("node retired") }
+}
+impl std::error::Error for Retired {}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -68,42 +94,34 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%node_id, %hostname, kiln = %opts.kiln, "ingot starting");
 
     let hv = hv::Libvirt::connect(&opts.libvirt)?;
-    let reserve = Capacity { vcpus: opts.reserve_vcpus, memory_mb: opts.reserve_memory_mb, disk_gb: 0 };
+    let reserve = Capacity { vcpus: opts.reserve_vcpus, memory_mb: opts.reserve_memory_mb, disk_gb: opts.reserve_disk_gb };
     let reconciler = Arc::new(Mutex::new(Reconciler::new(hv, opts.state_dir.join("disks"), images_dir, reserve)));
 
-    // Reconcile toward the cached desired state before talking to anyone, so
-    // VMs come back after a host reboot even if kiln is unreachable.
-    let desired = Arc::new(Mutex::new(state::load_desired(&opts.state_dir)?));
-    if let Some(d) = desired.lock().unwrap().clone() {
-        tracing::info!(generation = d.generation, "reconciling from cached desired state");
-        run_reconcile(&reconciler, &d).await;
-    }
-
-    let kiln = Kiln::new(&opts.kiln, node_id);
-    let register = RegisterRequest { node_id, hostname, arch, capacity: snapshot_capacity(&reconciler).await };
+    // Loading the cache validates it, but only a fresh authenticated response
+    // authorizes resource changes. Existing VMs keep running while disconnected.
+    let cached = state::load_desired(&opts.state_dir)?;
+    let token = identity::load_or_create_token(&opts.state_dir)?;
+    let kiln = Kiln::new(&opts.kiln, node_id, token);
+    let register = RegisterRequest { node_id, hostname, arch, capacity: snapshot_capacity(&reconciler, cached.clone()).await };
     register_until_approved(&kiln, &register).await?;
 
-    let a = tokio::spawn(desired_loop(kiln.clone(), opts.state_dir.clone(), desired.clone(), reconciler.clone()));
-    let b = tokio::spawn(report_loop(kiln, desired, reconciler));
+    let (updates, rx) = tokio::sync::watch::channel(ControllerState::default());
+    let (failures, errors) = tokio::sync::mpsc::channel(1);
     tokio::select! {
-        r = a => r??,
-        r = b => r??,
+        result = desired_loop(kiln.clone(), opts.state_dir, cached, register, updates, errors) => result,
+        result = reconcile_loop(kiln, rx, failures, reconciler) => result,
     }
-    Ok(())
 }
 
-async fn run_reconcile(reconciler: &Arc<Mutex<Reconciler>>, desired: &DesiredNodeState) {
+async fn snapshot_capacity(reconciler: &Arc<Mutex<Reconciler>>, cached: Option<DesiredNodeState>) -> Capacity {
     let r = reconciler.clone();
-    let d = desired.clone();
-    tokio::task::spawn_blocking(move || r.lock().unwrap().reconcile(&d)).await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        let r = r.lock().unwrap();
+        cached.as_ref().map_or_else(|| r.capacity(), |inventory| r.capacity_for(inventory))
+    }).await.unwrap()
 }
 
-async fn snapshot_capacity(reconciler: &Arc<Mutex<Reconciler>>) -> Capacity {
-    let r = reconciler.clone();
-    tokio::task::spawn_blocking(move || r.lock().unwrap().capacity()).await.unwrap()
-}
-
-async fn register_until_approved(kiln: &Kiln, req: &RegisterRequest) -> anyhow::Result<()> {
+async fn register_until_approved(kiln: &impl NodeClient, req: &RegisterRequest) -> anyhow::Result<()> {
     let mut announced = false;
     loop {
         match kiln.register(req).await {
@@ -117,66 +135,115 @@ async fn register_until_approved(kiln: &Kiln, req: &RegisterRequest) -> anyhow::
                     announced = true;
                 }
             }
-            Ok(RegistrationStatus::Retired) => anyhow::bail!("this node has been retired by the admin; refusing to run"),
+            Ok(RegistrationStatus::Retired) => return Err(Retired.into()),
+            Err(e) if client::terminal(&e) => return Err(e.context("node credential rejected")),
             Err(e) => tracing::warn!(error = %e, "kiln unreachable; retrying"),
         }
         tokio::time::sleep(RETRY_BACKOFF).await;
     }
 }
 
-/// Long-poll desired state. Each new generation is persisted before it is
-/// acted on. Also re-runs reconcile periodically so crashed VMs restart and
-/// failed starts get their retries.
+/// Only the polling task publishes connection state. Revisions identify
+/// individual responses, including repeated responses for the same generation.
+#[derive(Clone, Default)]
+struct ControllerState {
+    revision: u64,
+    desired: Option<DesiredNodeState>,
+}
+
+struct ReportFailure {
+    revision: u64,
+    error: anyhow::Error,
+}
+
+/// Polling stays independent of reconciliation and its retry timer.
 async fn desired_loop(
-    kiln: Kiln,
+    kiln: impl NodeClient,
     state_dir: PathBuf,
-    desired: Arc<Mutex<Option<DesiredNodeState>>>,
-    reconciler: Arc<Mutex<Reconciler>>,
+    mut cached: Option<DesiredNodeState>,
+    registration: RegisterRequest,
+    updates: tokio::sync::watch::Sender<ControllerState>,
+    mut failures: tokio::sync::mpsc::Receiver<ReportFailure>,
 ) -> anyhow::Result<()> {
+    // Always fetch immediately at startup, including after a controller restore.
+    let mut after = None;
+    let mut revision = 0;
     loop {
-        let after = desired.lock().unwrap().as_ref().map(|d| d.generation);
-        match kiln.desired(after).await {
+        let response = tokio::select! {
+            biased;
+            failure = failures.recv() => {
+                let failure = failure.context("reconciliation worker stopped")?;
+                // A newer desired response already restored connectivity. A
+                // failure from an older report cannot revoke that response.
+                if failure.revision != revision { continue }
+                Err(failure.error)
+            }
+            response = kiln.desired(after) => response,
+        };
+        revision += 1;
+        match response {
             Ok(d) => {
-                let is_new = after != Some(d.generation);
-                if is_new {
+                if cached.as_ref() != Some(&d) {
                     state::save_desired(&state_dir, &d)?;
                     tracing::info!(generation = d.generation, instances = d.instances.len(), "new desired state");
-                    *desired.lock().unwrap() = Some(d.clone());
+                    cached = Some(d.clone());
                 }
-                run_reconcile(&reconciler, &d).await;
+                after = Some(d.generation);
+                updates.send_replace(ControllerState { revision, desired: Some(d) });
             }
             Err(e) => {
-                tracing::warn!(error = %e, "desired-state poll failed");
-                let cached = desired.lock().unwrap().clone();
-                if let Some(d) = cached {
-                    run_reconcile(&reconciler, &d).await;
+                updates.send_replace(ControllerState { revision, desired: None });
+                after = None;
+                if client::terminal(&e) { return Err(e.context("node no longer authorized; reconciliation stopped")) }
+                if client::pending(&e) {
+                    tracing::warn!("node pending; returning to registration");
+                    register_until_approved(&kiln, &registration).await?;
+                } else {
+                    tracing::warn!(error = %e, "controller request failed; preserving existing workloads");
+                    tokio::time::sleep(RETRY_BACKOFF).await;
                 }
-                tokio::time::sleep(RETRY_BACKOFF).await;
             }
         }
     }
 }
 
-/// Report observed state every REPORT_EVERY. Only the latest report matters,
-/// so a failed send is simply superseded by the next one.
-async fn report_loop(
-    kiln: Kiln,
-    desired: Arc<Mutex<Option<DesiredNodeState>>>,
-    reconciler: Arc<Mutex<Reconciler>>,
+async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
+    kiln: impl NodeClient,
+    mut rx: tokio::sync::watch::Receiver<ControllerState>,
+    failures: tokio::sync::mpsc::Sender<ReportFailure>,
+    reconciler: Arc<Mutex<Reconciler<H>>>,
 ) -> anyhow::Result<()> {
+    let mut timer = tokio::time::interval(REPORT_EVERY);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ready = true;
     loop {
-        let generation_seen = desired.lock().unwrap().as_ref().map(|d| d.generation).unwrap_or(0);
-        let r = reconciler.clone();
-        let (instances, capacity) = tokio::task::spawn_blocking(move || {
-            let r = r.lock().unwrap();
-            (r.observe(), r.capacity())
-        })
-        .await
-        .unwrap();
-        let report = ObservedNodeState { generation_seen, instances, capacity };
-        if let Err(e) = kiln.observed(&report).await {
-            tracing::warn!(error = %e, "report failed");
+        if !ready {
+            tokio::select! {
+                _ = timer.tick() => {},
+                result = rx.changed() => { result?; },
+            }
         }
-        tokio::time::sleep(REPORT_EVERY).await;
+        ready = false;
+        let controller = rx.borrow_and_update().clone();
+        let Some(report) = reconcile_snapshot(reconciler.clone(), controller.desired).await? else { continue };
+        if let Err(error) = kiln.observed(&report).await {
+            failures.send(ReportFailure { revision: controller.revision, error }).await?;
+            // Wait for the polling task to either suspend us or supply a newer
+            // response. Never continue acting on the failed report's snapshot.
+            rx.changed().await?;
+            ready = true;
+        }
     }
+}
+
+async fn reconcile_snapshot<H: hv::Hypervisor + Send + 'static>(
+    reconciler: Arc<Mutex<Reconciler<H>>>,
+    authorized: Option<DesiredNodeState>,
+) -> anyhow::Result<Option<ObservedNodeState>> {
+    let Some(desired) = authorized else { return Ok(None) };
+    Ok(Some(tokio::task::spawn_blocking(move || {
+        let mut r = reconciler.lock().unwrap();
+        r.reconcile(&desired);
+        r.observe()
+    }).await?))
 }

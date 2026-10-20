@@ -7,6 +7,8 @@ mod error;
 mod node_api;
 mod placement;
 mod user_api;
+#[cfg(test)]
+mod tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,8 +43,9 @@ enum Cmd {
     Token {
         #[arg(long)]
         user: String,
-        #[arg(long, value_enum, default_value = "user")]
-        role: RoleArg,
+        /// Preserve an existing role unless explicitly supplied. New users default to user.
+        #[arg(long, value_enum)]
+        role: Option<RoleArg>,
     },
 }
 
@@ -77,12 +80,19 @@ async fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
     let conn = db::open(&opts.db)?;
 
-    match opts.cmd.unwrap_or(Cmd::Serve { listen: "127.0.0.1:8400".parse()?, bridge: "br0".into() }) {
+    let cmd = match opts.cmd {
+        Some(cmd) => cmd,
+        None => Cmd::Serve {
+            listen: std::env::var("KILN_LISTEN").unwrap_or_else(|_| "127.0.0.1:8400".into()).parse()?,
+            bridge: std::env::var("KILN_BRIDGE").unwrap_or_else(|_| "br0".into()),
+        },
+    };
+    match cmd {
         Cmd::Token { user, role } => {
-            let role = match role {
+            let role = role.map(|role| match role {
                 RoleArg::Admin => Role::Admin,
                 RoleArg::User => Role::User,
-            };
+            });
             let token = auth::issue_token(&conn, &user, role)?;
             println!("{token}");
             Ok(())

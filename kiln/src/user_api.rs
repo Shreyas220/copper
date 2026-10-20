@@ -20,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/projects/{project}/instances/{name}", get(get_instance).delete(delete_instance))
         .route("/v1/projects/{project}/instances/{name}/start", post(start_instance))
         .route("/v1/projects/{project}/instances/{name}/stop", post(stop_instance))
+        .route("/v1/instances/{id}/forget", post(forget_instance))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/{id}/approve", post(approve_node))
         .route("/v1/nodes/{id}/retire", post(retire_node))
@@ -45,11 +46,17 @@ struct CreateProject {
 #[derive(serde::Serialize)]
 struct ProjectOut {
     name: String,
+    owner: String,
 }
 
 async fn list_projects(State(state): State<AppState>, auth: Auth) -> Result<Json<Vec<ProjectOut>>> {
     let conn = state.db.lock().unwrap();
-    Ok(Json(db::list_projects(&conn, auth.0.id)?.into_iter().map(|p| ProjectOut { name: p.name }).collect()))
+    let projects = if auth.0.role == Role::Admin {
+        db::list_all_projects(&conn)?
+    } else {
+        db::list_projects(&conn, auth.0.id)?.into_iter().map(|p| (p, auth.0.name.clone())).collect()
+    };
+    Ok(Json(projects.into_iter().map(|(p, owner)| ProjectOut { name: p.name, owner }).collect()))
 }
 
 async fn create_project(
@@ -63,11 +70,16 @@ async fn create_project(
         return Err(Error::conflict("project already exists"));
     }
     let p = db::create_project(&conn, auth.0.id, &req.name)?;
-    Ok((StatusCode::CREATED, Json(ProjectOut { name: p.name })))
+    Ok((StatusCode::CREATED, Json(ProjectOut { name: p.name, owner: auth.0.name })))
 }
 
 fn project(conn: &rusqlite::Connection, auth: &Auth, name: &str) -> Result<Project> {
-    db::project_by_name(conn, auth.0.id, name)?.ok_or_else(|| Error::not_found("project"))
+    let (owner, name) = if let Some((owner, name)) = name.split_once(':') {
+        if owner != auth.0.name && auth.0.role != Role::Admin { return Err(Error::forbidden()) }
+        let user = db::user_by_name(conn, owner)?.ok_or_else(|| Error::not_found("project"))?;
+        (user.id, name)
+    } else { (auth.0.id, name) };
+    db::project_by_name(conn, owner, name)?.ok_or_else(|| Error::not_found("project"))
 }
 
 // ---- instances -------------------------------------------------------------
@@ -111,8 +123,8 @@ async fn create_instance(
     if req.vcpus == 0 || req.memory_mb < 128 || req.disk_gb == 0 {
         return Err(Error::bad_request("vcpus, memory_mb and disk_gb must be positive (memory at least 128 MB)"));
     }
-    if req.image.is_empty() {
-        return Err(Error::bad_request("image is required"));
+    if !valid_image_name(&req.image) {
+        return Err(Error::bad_request("image must be a filename stem using lowercase letters, digits, '.', '_' or '-', starting with a letter or digit"));
     }
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
@@ -129,35 +141,24 @@ async fn create_instance(
     };
     // Placement and insert are one transaction so two creates can't both land
     // on the last slot of a node.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let outcome = (|| -> Result<InstanceRow> {
-        let node = placement::choose(&conn, &spec)?;
-        let row = InstanceRow {
-            id: InstanceId::new_v4(),
-            project_id: p.id,
-            name: req.name.clone(),
-            node_id: node.id,
-            desired: DesiredState::Running,
-            spec,
-            observed: None,
-        };
-        db::insert_instance(&conn, &row)?;
-        db::bump_generation(&conn, node.id)?;
-        Ok(row)
-    })();
-    match outcome {
-        Ok(row) => {
-            conn.execute_batch("COMMIT")?;
-            state.notify_changed();
-            tracing::info!(instance = %row.id, name = %row.name, node = %row.node_id, "instance created");
-            let admin = auth.0.role == Role::Admin;
-            Ok((StatusCode::CREATED, Json(to_api(&conn, row, &project, admin)?)))
-        }
-        Err(e) => {
-            conn.execute_batch("ROLLBACK")?;
-            Err(e)
-        }
-    }
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    let node = placement::choose(&tx, &spec)?;
+    let row = InstanceRow {
+        id: InstanceId::new_v4(),
+        project_id: p.id,
+        name: req.name,
+        node_id: node.id,
+        desired: DesiredState::Running,
+        spec,
+        observed: None,
+    };
+    db::insert_instance(&tx, &row)?;
+    db::bump_generation(&tx, node.id)?;
+    tx.commit()?;
+    state.notify_changed();
+    tracing::info!(instance = %row.id, name = %row.name, node = %row.node_id, "instance created");
+    let admin = auth.0.role == Role::Admin;
+    Ok((StatusCode::CREATED, Json(to_api(&conn, row, &project, admin)?)))
 }
 
 fn load(conn: &rusqlite::Connection, auth: &Auth, project: &str, name: &str) -> Result<InstanceRow> {
@@ -182,8 +183,10 @@ fn set_desired(state: &AppState, auth: &Auth, project: &str, name: &str, desired
         return Err(Error::conflict("instance is being deleted"));
     }
     if row.desired != desired {
-        db::set_desired(&conn, row.id, desired)?;
-        db::bump_generation(&conn, row.node_id)?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        db::set_desired(&tx, row.id, desired)?;
+        db::bump_generation(&tx, row.node_id)?;
+        tx.commit()?;
         state.notify_changed();
         tracing::info!(instance = %row.id, ?desired, "desired state changed");
     }
@@ -205,8 +208,10 @@ async fn delete_instance(State(state): State<AppState>, auth: Auth, Path((projec
     let conn = state.db.lock().unwrap();
     let row = load(&conn, &auth, &project, &name)?;
     if row.desired != DesiredState::Absent {
-        db::set_desired(&conn, row.id, DesiredState::Absent)?;
-        db::bump_generation(&conn, row.node_id)?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        db::set_desired(&tx, row.id, DesiredState::Absent)?;
+        db::bump_generation(&tx, row.node_id)?;
+        tx.commit()?;
         state.notify_changed();
         tracing::info!(instance = %row.id, "instance delete requested");
     }
@@ -228,7 +233,9 @@ async fn approve_node(State(state): State<AppState>, auth: Auth, Path(id): Path<
     if node.status == NodeDbStatus::Retired {
         return Err(Error::conflict("node is retired"));
     }
+    if node.token_hash.is_none() { return Err(Error::conflict("node must register its credential before approval")) }
     db::set_node_status(&conn, id, NodeDbStatus::Approved)?;
+    state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node approved");
     Ok(Json(db::node(&conn, id)?.unwrap().to_api()))
 }
@@ -238,10 +245,11 @@ async fn retire_node(State(state): State<AppState>, auth: Auth, Path(id): Path<N
     auth.require_admin()?;
     let conn = state.db.lock().unwrap();
     let node = db::node(&conn, id)?.ok_or_else(|| Error::not_found("node"))?;
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    db::set_node_status(&conn, id, NodeDbStatus::Retired)?;
-    db::fail_instances_on_node(&conn, id, "node retired")?;
-    conn.execute_batch("COMMIT")?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    db::set_node_status(&tx, id, NodeDbStatus::Retired)?;
+    db::fail_instances_on_node(&tx, id, "node retired")?;
+    tx.commit()?;
+    state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node retired");
     Ok(Json(db::node(&conn, id)?.unwrap().to_api()))
 }
@@ -262,4 +270,20 @@ fn random_mac() -> String {
     let mut b = [0u8; 3];
     rand::rng().fill_bytes(&mut b);
     format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
+}
+
+/// Forget tracking only after retirement; this never claims disks were erased.
+async fn forget_instance(State(state): State<AppState>, auth: Auth, Path(id): Path<InstanceId>) -> Result<StatusCode> {
+    auth.require_admin()?;
+    let conn = state.db.lock().unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    let row = db::instance(&tx, id)?.ok_or_else(|| Error::not_found("instance"))?;
+    let node = db::node(&tx, row.node_id)?.ok_or_else(|| Error::not_found("node"))?;
+    if node.status != NodeDbStatus::Retired { return Err(Error::conflict("retire the node before forgetting its instances")) }
+    db::delete_instance(&tx, id)?;
+    db::bump_generation(&tx, row.node_id)?;
+    tx.commit()?;
+    state.notify_changed();
+    tracing::warn!(instance = %id, node = %row.node_id, "instance forgotten; host resources require manual cleanup");
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -56,6 +56,8 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (project_id, name)
     );
     "#,
+    "ALTER TABLE nodes ADD COLUMN token_hash TEXT;
+     UPDATE nodes SET status = 'pending', last_seen = NULL WHERE status = 'approved';",
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -71,13 +73,16 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    anyhow::ensure!(current >= 0 && current as usize <= MIGRATIONS.len(), "unsupported database schema version {current}");
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         let version = i as i64 + 1;
         tracing::info!(version, "applying migration");
-        conn.execute_batch(sql)?;
-        conn.pragma_update(None, "user_version", version)?;
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", version)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -113,13 +118,15 @@ pub struct User {
     pub role: Role,
 }
 
-pub fn ensure_user(conn: &Connection, name: &str, role: Role) -> rusqlite::Result<User> {
+pub fn ensure_user(conn: &Connection, name: &str, role: Option<Role>) -> rusqlite::Result<User> {
     if let Some(u) = user_by_name(conn, name)? {
+        let role = role.unwrap_or(u.role);
         if u.role != role {
             conn.execute("UPDATE users SET role = ?1 WHERE id = ?2", params![enum_to_text(&role), u.id.to_string()])?;
         }
         return Ok(User { role, ..u });
     }
+    let role = role.unwrap_or(Role::User);
     let id = Uuid::new_v4();
     conn.execute(
         "INSERT INTO users (id, name, role) VALUES (?1, ?2, ?3)",
@@ -206,6 +213,7 @@ pub struct NodeRow {
     pub generation: Generation,
     pub last_seen: Option<i64>,
     pub capacity: Capacity,
+    pub token_hash: Option<String>,
 }
 
 impl NodeRow {
@@ -236,10 +244,11 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
         last_seen: r.get(5)?,
         capacity: serde_json::from_str(&r.get::<_, String>(6)?)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?,
+        token_hash: r.get(7)?,
     })
 }
 
-const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json";
+const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash";
 
 pub fn node(conn: &Connection, id: NodeId) -> rusqlite::Result<Option<NodeRow>> {
     conn.query_row(&format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"), [id.to_string()], node_from_row).optional()
@@ -251,16 +260,30 @@ pub fn list_nodes(conn: &Connection) -> rusqlite::Result<Vec<NodeRow>> {
         .collect()
 }
 
-/// Insert as pending if unknown. Hostname and capacity are refreshed on every call.
-pub fn register_node(conn: &Connection, req: &RegisterRequest) -> rusqlite::Result<NodeDbStatus> {
-    let cap = serde_json::to_string(&req.capacity).unwrap();
-    conn.execute(
-        "INSERT INTO nodes (id, hostname, arch, status, capacity_json)
-         VALUES (?1, ?2, ?3, 'pending', ?4)
-         ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, capacity_json = excluded.capacity_json",
-        params![req.node_id.to_string(), req.hostname, enum_to_text(&req.arch), cap],
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterNodeOutcome {
+    Registered(NodeDbStatus),
+    CredentialMismatch,
+}
+
+/// Pin the credential before approval. Known-node capacity is refreshed only
+/// by an observation for the current generation, never by registration.
+pub fn register_node(conn: &Connection, req: &RegisterRequest, token_hash: &str) -> anyhow::Result<RegisterNodeOutcome> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let existing = node(&tx, req.node_id)?;
+    if existing.as_ref().and_then(|node| node.token_hash.as_deref()).is_some_and(|hash| hash != token_hash) {
+        return Ok(RegisterNodeOutcome::CredentialMismatch);
+    }
+    let status = existing.map_or(NodeDbStatus::Pending, |node| node.status);
+    tx.execute(
+        "INSERT INTO nodes (id, hostname, arch, status, capacity_json, token_hash)
+         VALUES (?1, ?2, ?3, 'pending', ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname,
+             token_hash = COALESCE(nodes.token_hash, excluded.token_hash)",
+        params![req.node_id.to_string(), req.hostname, enum_to_text(&req.arch), serde_json::to_string(&req.capacity)?, token_hash],
     )?;
-    Ok(node(conn, req.node_id)?.map(|n| n.status).unwrap_or(NodeDbStatus::Pending))
+    tx.commit()?;
+    Ok(RegisterNodeOutcome::Registered(status))
 }
 
 pub fn set_node_status(conn: &Connection, id: NodeId, status: NodeDbStatus) -> rusqlite::Result<bool> {
@@ -378,4 +401,44 @@ pub fn fail_instances_on_node(conn: &Connection, node: NodeId, reason: &str) -> 
         set_observed(conn, &obs)?;
     }
     Ok(())
+}
+
+pub fn list_all_projects(conn: &Connection) -> rusqlite::Result<Vec<(Project, String)>> {
+    conn.prepare("SELECT p.id, p.name, p.owner_id, u.name FROM projects p JOIN users u ON p.owner_id = u.id ORDER BY u.name, p.name")?
+        .query_map([], |r| Ok((Project { id: uuid_col(r, 0)?, name: r.get(1)?, owner_id: uuid_col(r, 2)? }, r.get(3)?)))?.collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_failure_rolls_back_schema_and_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE tokens (already_here TEXT)").unwrap();
+        assert!(migrate(&conn).is_err());
+        assert!(conn.is_autocommit());
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 0);
+        let nodes: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'nodes')", [], |r| r.get(0)).unwrap();
+        assert!(!nodes);
+    }
+
+    #[test]
+    fn legacy_nodes_require_credential_enrollment_and_reapproval() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let id = NodeId::new_v4();
+        conn.execute("INSERT INTO nodes (id, hostname, arch, status, capacity_json) VALUES (?1, 'legacy', 'x86_64', 'approved', ?2)",
+            params![id.to_string(), r#"{"vcpus":8,"memory_mb":16384,"disk_gb":100}"#]).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(node(&conn, id).unwrap().unwrap().status, NodeDbStatus::Pending);
+        assert!(node(&conn, id).unwrap().unwrap().token_hash.is_none());
+        let req = RegisterRequest { node_id: id, hostname: "legacy".into(), arch: Arch::X86_64,
+            capacity: Capacity { vcpus: 8, memory_mb: 16384, disk_gb: 100 } };
+        assert_eq!(register_node(&conn, &req, "pinned-hash").unwrap(), RegisterNodeOutcome::Registered(NodeDbStatus::Pending));
+        assert_eq!(node(&conn, id).unwrap().unwrap().token_hash.as_deref(), Some("pinned-hash"));
+        assert_eq!(register_node(&conn, &req, "different-hash").unwrap(), RegisterNodeOutcome::CredentialMismatch);
+    }
 }

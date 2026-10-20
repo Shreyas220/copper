@@ -19,8 +19,12 @@ impl Disks {
     pub fn seed_path(&self, id: InstanceId) -> PathBuf {
         self.dir.join(format!("{id}-seed.iso"))
     }
-    pub fn image_path(&self, name: &str) -> PathBuf {
-        self.images.join(format!("{name}.img"))
+    pub fn image_path(&self, name: &str) -> anyhow::Result<PathBuf> {
+        if !valid_image_name(name) { bail!("invalid image name") }
+        let root = self.images.canonicalize().context("opening images directory")?;
+        let image = root.join(format!("{name}.img")).canonicalize().context("opening base image")?;
+        if !image.starts_with(&root) || !image.is_file() { bail!("image escapes images directory or is not a file") }
+        Ok(image)
     }
 
     /// Create the overlay if it does not exist. Idempotent.
@@ -29,16 +33,13 @@ impl Disks {
         if path.exists() {
             return Ok(path);
         }
-        let base = self.image_path(&spec.boot_disk.image);
-        if !base.exists() {
-            bail!("image {} not found at {}", spec.boot_disk.image, base.display());
-        }
+        let base = self.image_path(&spec.boot_disk.image)?;
         std::fs::create_dir_all(&self.dir)?;
         // Write to a temp name and rename, so a crash never leaves a half-made
         // disk that looks real.
         let tmp = path.with_extension("qcow2.tmp");
         run(Command::new("qemu-img").args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"]).arg(&base).arg(&tmp).arg(format!("{}G", spec.boot_disk.size_gb)))?;
-        std::fs::rename(&tmp, &path)?;
+        crate::state::publish_file(&tmp, &path)?;
         tracing::info!(instance = %id, disk = %path.display(), "boot disk created");
         Ok(path)
     }
@@ -53,10 +54,10 @@ impl Disks {
         let user_data = self.dir.join(format!("{id}-user-data"));
         let meta_data = self.dir.join(format!("{id}-meta-data"));
         std::fs::write(&user_data, user_data_yaml(name, spec))?;
-        std::fs::write(&meta_data, format!("instance-id: {id}\nlocal-hostname: {name}\n"))?;
+        std::fs::write(&meta_data, format!("instance-id: {id}\nlocal-hostname: {}\n", serde_json::to_string(name)?))?;
         let tmp = path.with_extension("iso.tmp");
         run(Command::new("cloud-localds").arg(&tmp).arg(&user_data).arg(&meta_data))?;
-        std::fs::rename(&tmp, &path)?;
+        crate::state::publish_file(&tmp, &path)?;
         let _ = std::fs::remove_file(user_data);
         let _ = std::fs::remove_file(meta_data);
         Ok(path)
@@ -75,24 +76,36 @@ impl Disks {
                 Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
             }
         }
+        if self.dir.exists() { std::fs::File::open(&self.dir)?.sync_all()?; }
         Ok(())
     }
 
-    /// Free space on the disk directory's filesystem, in GB.
-    pub fn free_gb(&self) -> u64 {
+    /// Physical free bytes plus Copper's allocated blocks. Kiln subtracts
+    /// virtual reservations once; unrelated host usage reduces this budget.
+    pub fn allocatable_gb(&self, ids: impl Iterator<Item = InstanceId>) -> u64 {
+        use std::os::unix::fs::MetadataExt;
         let probe = if self.dir.exists() { self.dir.clone() } else { self.dir.parent().map(Path::to_path_buf).unwrap_or(self.dir.clone()) };
         let c = std::ffi::CString::new(probe.to_string_lossy().as_bytes()).unwrap();
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return 0;
         }
-        (st.f_bavail as u64 * st.f_frsize as u64) / (1024 * 1024 * 1024)
+        let mut allocated = 0u64;
+        for id in ids {
+            match std::fs::symlink_metadata(self.disk_path(id)) {
+                Ok(meta) if meta.is_file() => allocated = allocated.saturating_add(meta.blocks().saturating_mul(512)),
+                Ok(_) => return 0,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => return 0,
+            }
+        }
+        (st.f_bavail.saturating_mul(st.f_frsize).saturating_add(allocated)) / (1024 * 1024 * 1024)
     }
 }
 
 fn user_data_yaml(name: &str, spec: &InstanceSpec) -> String {
     let mut y = String::from("#cloud-config\n");
-    y.push_str(&format!("hostname: {name}\n"));
+    y.push_str(&format!("hostname: {}\n", serde_json::to_string(name).unwrap()));
     y.push_str("manage_etc_hosts: true\n");
     // The guest agent lets ingot read addresses straight from the guest.
     y.push_str("packages:\n  - qemu-guest-agent\n");
@@ -100,7 +113,7 @@ fn user_data_yaml(name: &str, spec: &InstanceSpec) -> String {
     if !spec.ssh_keys.is_empty() {
         y.push_str("ssh_authorized_keys:\n");
         for k in &spec.ssh_keys {
-            y.push_str(&format!("  - {k}\n"));
+            y.push_str(&format!("  - {}\n", serde_json::to_string(k).unwrap()));
         }
     }
     y
@@ -112,4 +125,36 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
         bail!("{:?} failed: {}", cmd.get_program(), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn image_paths_reject_traversal_and_symlink_escape() {
+        let dir = TempDir::new();
+        let images = dir.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        std::fs::write(dir.path().join("private.img"), "data").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("private.img"), images.join("escape.img")).unwrap();
+        let disks = Disks { dir: dir.path().into(), images };
+        assert!(disks.image_path("../private").is_err());
+        assert!(disks.image_path("escape").is_err());
+        std::fs::write(disks.images.join("ubuntu-24.04.img"), "image").unwrap();
+        assert!(disks.image_path("ubuntu-24.04").is_ok());
+    }
+    #[test]
+    fn cloud_init_values_are_quoted_without_newline_injection() {
+        let spec = InstanceSpec { vcpus: 1, memory_mb: 1024, arch: Arch::X86_64,
+            boot_disk: BootDisk { image: "ubuntu".into(), size_gb: 10 }, nics: vec![],
+            ssh_keys: vec!["ssh-ed25519 key\nruncmd:\n  - malicious".into()] };
+        let data = user_data_yaml("vm\nusers: []", &spec);
+        assert!(!data.contains("\nusers:"));
+        assert_eq!(data.lines().filter(|line| *line == "runcmd:").count(), 1);
+        let line = data.lines().find(|line| line.starts_with("  - \"ssh-")).unwrap();
+        let key: String = serde_json::from_str(line.strip_prefix("  - ").unwrap()).unwrap();
+        assert_eq!(key, spec.ssh_keys[0]);
+    }
 }

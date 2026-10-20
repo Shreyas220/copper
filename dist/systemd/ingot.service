@@ -15,6 +15,7 @@ Environment=INGOT_STATE_DIR=/var/lib/copper
 ExecStart=/usr/local/bin/ingot
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=78
 NoNewPrivileges=yes
 PrivateTmp=yes
 

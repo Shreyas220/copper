@@ -131,3 +131,35 @@ pub struct ObservedNodeState {
     pub instances: Vec<ObservedInstance>,
     pub capacity: Capacity,
 }
+
+/// A single image filename stem, never a path or hidden directory component.
+pub fn valid_image_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn node_tokens_have_one_shared_validation_rule() {
+        assert!(valid_node_token(&"a1".repeat(32)));
+        for token in ["a".repeat(63), "a".repeat(65), "g".repeat(64), format!("{}\n", "a".repeat(63))] {
+            assert!(!valid_node_token(&token));
+        }
+    }
+
+    #[test]
+    fn image_names_are_single_components() {
+        for name in ["", ".", "..", "../nas/disk", "/etc/disk", "ubuntu/../../disk", "a\\b", "a\n", "UPPER"] {
+            assert!(!valid_image_name(name), "accepted {name:?}");
+        }
+        for name in ["ubuntu-24.04", "debian_12", "a..b"] { assert!(valid_image_name(name)); }
+    }
+}
+
+/// Enrollment credentials are generated as two random UUIDs without separators.
+pub fn valid_node_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}

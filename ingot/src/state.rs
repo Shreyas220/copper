@@ -1,5 +1,5 @@
-//! On-disk cache of the last desired state, so the agent can reconcile while
-//! the controller is unreachable.
+//! Durable cache of the last desired state. Resource changes still require
+//! a fresh authenticated controller response after startup or disconnection.
 
 use std::path::Path;
 
@@ -34,9 +34,18 @@ pub fn save_desired(state_dir: &Path, desired: &DesiredNodeState) -> anyhow::Res
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+        .open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    drop(f);
+    publish_file(&tmp, path)
+}
+
+/// Publish a fully written temporary file and persist the directory entry.
+pub fn publish_file(tmp: &Path, path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(tmp)?.sync_all()?;
+    std::fs::rename(tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    std::fs::File::open(path.parent().context("file needs a parent directory")?)?.sync_all()?;
     Ok(())
 }

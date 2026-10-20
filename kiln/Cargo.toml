@@ -22,3 +22,6 @@ axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 rand = "0.9"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -47,36 +47,26 @@ impl Libvirt {
         Ok((info.cpus, info.memory / 1024))
     }
 
-    fn lookup(&self, id: InstanceId) -> Option<Domain> {
-        Domain::lookup_by_name(&self.conn, &name_of(id)).ok()
+    fn lookup(&self, id: InstanceId) -> anyhow::Result<Option<Domain>> {
+        match Domain::lookup_by_name(&self.conn, &name_of(id)) {
+            Ok(domain) => Ok(Some(domain)),
+            Err(e) if e.code() == virt::error::ErrorNumber::NoDomain => Ok(None),
+            Err(e) => Err(err(e)),
+        }
     }
 
-    pub fn exists(&self, id: InstanceId) -> bool {
-        self.lookup(id).is_some()
-    }
-
-    pub fn state(&self, id: InstanceId) -> Option<DomState> {
-        let d = self.lookup(id)?;
-        let (s, _) = d.get_state().ok()?;
-        Some(match s {
+    pub fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>> {
+        let Some(d) = self.lookup(id)? else { return Ok(None) };
+        let (s, _) = d.get_state().map_err(err)?;
+        Ok(Some(match s {
             sys::VIR_DOMAIN_RUNNING | sys::VIR_DOMAIN_BLOCKED | sys::VIR_DOMAIN_PAUSED => DomState::Running,
             sys::VIR_DOMAIN_SHUTOFF | sys::VIR_DOMAIN_CRASHED | sys::VIR_DOMAIN_NOSTATE => DomState::Off,
             _ => DomState::Other,
-        })
-    }
-
-    /// Instance ids of every copper domain on this host.
-    pub fn list(&self) -> anyhow::Result<Vec<InstanceId>> {
-        let doms = self.conn.list_all_domains(0).map_err(err)?;
-        Ok(doms
-            .iter()
-            .filter_map(|d| d.get_name().ok())
-            .filter_map(|n| n.strip_prefix(PREFIX).and_then(|s| s.parse().ok()))
-            .collect())
+        }))
     }
 
     pub fn define(&self, id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> anyhow::Result<()> {
-        if self.exists(id) {
+        if self.lookup(id)?.is_some() {
             return Ok(());
         }
         let xml = domain_xml(id, spec, disk, seed);
@@ -86,7 +76,7 @@ impl Libvirt {
     }
 
     pub fn start(&self, id: InstanceId) -> anyhow::Result<()> {
-        let d = self.lookup(id).ok_or_else(|| anyhow!("domain missing"))?;
+        let d = self.lookup(id)?.ok_or_else(|| anyhow!("domain missing"))?;
         if d.is_active().map_err(err)? {
             return Ok(());
         }
@@ -97,7 +87,7 @@ impl Libvirt {
 
     /// Ask the guest to shut down (ACPI power button).
     pub fn shutdown(&self, id: InstanceId) -> anyhow::Result<()> {
-        let d = self.lookup(id).ok_or_else(|| anyhow!("domain missing"))?;
+        let d = self.lookup(id)?.ok_or_else(|| anyhow!("domain missing"))?;
         if !d.is_active().map_err(err)? {
             return Ok(());
         }
@@ -107,7 +97,7 @@ impl Libvirt {
 
     /// Pull the plug.
     pub fn destroy(&self, id: InstanceId) -> anyhow::Result<()> {
-        let d = self.lookup(id).ok_or_else(|| anyhow!("domain missing"))?;
+        let d = self.lookup(id)?.ok_or_else(|| anyhow!("domain missing"))?;
         if !d.is_active().map_err(err)? {
             return Ok(());
         }
@@ -117,7 +107,7 @@ impl Libvirt {
     }
 
     pub fn undefine(&self, id: InstanceId) -> anyhow::Result<()> {
-        let Some(d) = self.lookup(id) else { return Ok(()) };
+        let Some(d) = self.lookup(id)? else { return Ok(()) };
         if d.is_active().map_err(err)? {
             d.destroy().map_err(err)?;
         }
@@ -133,7 +123,7 @@ impl Libvirt {
     /// fallback, which only knows a guest the host has exchanged traffic with
     /// (bridged VMs don't get libvirt DHCP leases).
     pub fn addresses(&self, id: InstanceId) -> Vec<String> {
-        let Some(d) = self.lookup(id) else { return vec![] };
+        let Ok(Some(d)) = self.lookup(id) else { return vec![] };
         for source in [sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT, sys::VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_ARP] {
             let Ok(ifaces) = d.interface_addresses(source, 0) else { continue };
             let mut out: Vec<String> = ifaces
@@ -168,7 +158,7 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
         .map(|n| {
             format!(
                 "    <interface type='bridge'>\n      <source bridge='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n    </interface>\n",
-                n.bridge, n.mac
+                xml_escape(&n.bridge), xml_escape(&n.mac)
             )
         })
         .collect();
@@ -216,7 +206,35 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
         name = name_of(id),
         mem = spec.memory_mb,
         vcpus = spec.vcpus,
-        disk = disk.display(),
-        seed = seed.display(),
+        disk = xml_escape(&disk.to_string_lossy()),
+        seed = xml_escape(&seed.to_string_lossy()),
     )
+}
+
+fn xml_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('\"', "&quot;").replace('\'', "&apos;")
+}
+
+/// The reconciler can be exercised without a running hypervisor.
+pub trait Hypervisor {
+    fn node_capacity(&self) -> anyhow::Result<(u32, u64)>;
+    fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>>;
+    fn define(&self, id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> anyhow::Result<()>;
+    fn start(&self, id: InstanceId) -> anyhow::Result<()>;
+    fn shutdown(&self, id: InstanceId) -> anyhow::Result<()>;
+    fn destroy(&self, id: InstanceId) -> anyhow::Result<()>;
+    fn undefine(&self, id: InstanceId) -> anyhow::Result<()>;
+    fn addresses(&self, id: InstanceId) -> Vec<String>;
+}
+
+impl Hypervisor for Libvirt {
+    fn node_capacity(&self) -> anyhow::Result<(u32, u64)> { self.node_capacity() }
+    fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>> { self.state(id) }
+    fn define(&self, id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> anyhow::Result<()> { self.define(id, spec, disk, seed) }
+    fn start(&self, id: InstanceId) -> anyhow::Result<()> { self.start(id) }
+    fn shutdown(&self, id: InstanceId) -> anyhow::Result<()> { self.shutdown(id) }
+    fn destroy(&self, id: InstanceId) -> anyhow::Result<()> { self.destroy(id) }
+    fn undefine(&self, id: InstanceId) -> anyhow::Result<()> { self.undefine(id) }
+    fn addresses(&self, id: InstanceId) -> Vec<String> { self.addresses(id) }
 }

@@ -67,6 +67,9 @@ pub struct CreateInstance {
     pub arch: Arch,
     pub image: String,
     pub disk_gb: u64,
+    /// SSH public keys for the default user.
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

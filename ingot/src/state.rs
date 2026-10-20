@@ -11,7 +11,15 @@ const FILE: &str = "desired.json";
 pub fn load_desired(state_dir: &Path) -> anyhow::Result<Option<DesiredNodeState>> {
     let path = state_dir.join(FILE);
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?)),
+        // A cache we can't parse (e.g. after a protocol change) is treated as
+        // absent rather than fatal: kiln will send a fresh copy.
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "ignoring unreadable desired-state cache");
+                Ok(None)
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }

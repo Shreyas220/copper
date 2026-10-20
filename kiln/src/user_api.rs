@@ -125,6 +125,7 @@ async fn create_instance(
         arch: req.arch,
         boot_disk: BootDisk { image: req.image.clone(), size_gb: req.disk_gb },
         nics: vec![Nic { bridge: state.bridge.clone(), mac: random_mac() }],
+        ssh_keys: req.ssh_keys.clone(),
     };
     // Placement and insert are one transaction so two creates can't both land
     // on the last slot of a node.

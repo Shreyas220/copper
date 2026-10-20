@@ -44,8 +44,13 @@ Derived from (desired, observed), never stored:
 Failed: the agent retries start with backoff for 5 minutes, then reports failed with the error. Stop then start resets the budget. Stop and delete are allowed from any state.
 
 ## Node side
-- libvirt via `qemu:///system` for v1. Domains carry copper metadata; everything else on the host is ignored.
-- Boot disks are qcow2 overlays on base images in `/var/lib/copper/images/`, fetched from the controller by hash.
+- libvirt via `qemu:///system` for v1. Copper domains are named `copper-<instance id>`; everything else on the host is ignored.
+- Boot disks are qcow2 overlays on base images. Images live in `<state dir>/images/<name>.img` for now; fetching them from kiln by hash is still to do.
+- cloud-init seed ISO carries the hostname, SSH keys, and installs `qemu-guest-agent`. Addresses come from the agent once it's up, with the host ARP table as a fallback before that.
+- Stop is ACPI shutdown, then destroy after 60 s if the guest ignores it.
+- Failed operations retry every 10 s for 5 min, then the instance reports `failed` until its desired state changes.
+- Capacity reported to kiln is host threads and memory minus a configurable reserve (default 2 threads, 4 GB) for the host itself.
+- ingot needs a user in the `libvirt` and `kvm` groups, `qemu-img` and `cloud-localds` on the node, and a disks directory that libvirt's qemu user can reach.
 
 ## User API
 - Projects group instances. Users have a role of admin or user.

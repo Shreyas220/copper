@@ -43,6 +43,9 @@ enum Cmd {
         disk: u64,
         #[arg(long, default_value = "x86_64")]
         arch: String,
+        /// SSH public key (text or path). Repeatable. Defaults to ~/.ssh/*.pub.
+        #[arg(long = "ssh-key")]
+        ssh_keys: Vec<String>,
     },
     Start { name: String },
     Stop { name: String },
@@ -93,6 +96,38 @@ impl Client {
     }
 }
 
+/// Each entry is either a path to a .pub file or the key text itself. With no
+/// entries, every ~/.ssh/*.pub is used.
+fn resolve_ssh_keys(entries: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut keys = Vec::new();
+    if entries.is_empty() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::Path::new(&home).join(".ssh");
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    if e.path().extension().is_some_and(|x| x == "pub") {
+                        keys.push(std::fs::read_to_string(e.path())?.trim().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        for e in entries {
+            let p = std::path::Path::new(&e);
+            if p.is_file() {
+                keys.push(std::fs::read_to_string(p)?.trim().to_string());
+            } else if e.starts_with("ssh-") || e.starts_with("ecdsa-") {
+                keys.push(e.trim().to_string());
+            } else {
+                bail!("{e}: not a public key file or key text");
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 fn print_instance(i: &Instance) {
     let state = serde_json::to_string(&i.state).unwrap().trim_matches('"').to_string();
     let node = i.node.map(|n| n.to_string()[..8].to_string()).unwrap_or_default();
@@ -139,9 +174,10 @@ async fn main() -> anyhow::Result<()> {
             let i: Instance = c.call(Method::GET, &format!("/v1/projects/{p}/instances/{name}"), None).await?;
             println!("{}", serde_json::to_string_pretty(&i)?);
         }
-        Cmd::Create { name, vcpus, memory, image, disk, arch } => {
+        Cmd::Create { name, vcpus, memory, image, disk, arch, ssh_keys } => {
             let arch: Arch = serde_json::from_value(serde_json::Value::String(arch)).context("arch must be x86_64 or aarch64")?;
-            let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk })?;
+            let ssh_keys = resolve_ssh_keys(ssh_keys)?;
+            let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk, ssh_keys })?;
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances"), Some(body)).await?;
             print_instance(&i);
         }

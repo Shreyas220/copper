@@ -78,11 +78,16 @@ pub struct InstanceSpec {
     pub arch: Arch,
     pub boot_disk: BootDisk,
     pub nics: Vec<Nic>,
+    /// Authorized keys for the default user, injected through cloud-init.
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredInstance {
     pub id: InstanceId,
+    /// User-chosen name; becomes the guest hostname.
+    pub name: String,
     pub state: DesiredState,
     pub spec: InstanceSpec,
 }

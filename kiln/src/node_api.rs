@@ -50,7 +50,7 @@ fn read_desired(state: &AppState, id: NodeId) -> Result<DesiredNodeState> {
     }
     let instances = db::list_instances_on_node(&conn, id)?
         .into_iter()
-        .map(|r| DesiredInstance { id: r.id, state: r.desired, spec: r.spec })
+        .map(|r| DesiredInstance { id: r.id, name: r.name, state: r.desired, spec: r.spec })
         .collect();
     Ok(DesiredNodeState { generation: node.generation, instances })
 }

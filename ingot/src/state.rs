@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use homecloud_api::DesiredNodeState;
+use copper_api::DesiredNodeState;
 
 const FILE: &str = "desired.json";
 

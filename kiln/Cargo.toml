@@ -1,15 +1,15 @@
 [package]
-name = "homecloud-controller"
+name = "kiln"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "homecloud-controller"
+name = "kiln"
 path = "src/main.rs"
 
 [dependencies]
-homecloud-api.workspace = true
+copper-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

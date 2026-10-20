@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use homecloud_api::NodeId;
+use copper_api::NodeId;
 
 const FILE: &str = "node-id";
 

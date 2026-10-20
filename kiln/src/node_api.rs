@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use homecloud_api::*;
+use copper_api::*;
 use serde::Deserialize;
 
 use crate::AppState;

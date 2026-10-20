@@ -5,11 +5,11 @@
   </picture>
 </p>
 
-homecloud: an Oxide-style mini cloud for a couple of home machines. Rust, plain systemd daemons.
+An Oxide-style mini cloud for a couple of home machines. Rust, plain systemd daemons.
 
-- `api/`        shared wire types for both the user API and the controller-agent protocol
-- `controller/` the control plane: SQLite source of truth, placement, user API
-- `agent/`      runs on every compute node, reconciles libvirt toward desired state
-- `hc/`         command line client
+- `kiln/`   the control plane: SQLite source of truth, placement, user API
+- `ingot/`  the node agent: runs on every compute node, reconciles libvirt toward desired state
+- `cu/`     the command line client
+- `api/`    wire types shared by all three
 
 See `docs/design.md` for the decisions so far.

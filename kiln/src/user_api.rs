@@ -2,7 +2,7 @@
 
 use axum::routing::get;
 use axum::{Json, Router};
-use homecloud_api::*;
+use copper_api::*;
 
 use crate::AppState;
 

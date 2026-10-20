@@ -1,14 +1,14 @@
-//! `hc`: command line client for the homecloud user API.
+//! `cu`: command line client for the copper user API.
 
 use clap::{Parser, Subcommand};
-use homecloud_api::*;
+use copper_api::*;
 
 #[derive(Parser)]
-#[command(name = "hc", version)]
+#[command(name = "cu", version)]
 struct Cli {
-    #[arg(long, env = "HC_URL", default_value = "http://127.0.0.1:8400")]
+    #[arg(long, env = "CU_URL", default_value = "http://127.0.0.1:8400")]
     url: String,
-    #[arg(long, env = "HC_TOKEN")]
+    #[arg(long, env = "CU_TOKEN")]
     token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,

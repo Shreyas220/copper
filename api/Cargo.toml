@@ -1,5 +1,5 @@
 [package]
-name = "homecloud-api"
+name = "copper-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-//! homecloud controller: SQLite source of truth, placement, user API, node API.
+//! kiln: SQLite source of truth, placement, user API, node API.
 
 mod db;
 mod node_api;
@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "homecloud-controller")]
+#[command(name = "kiln")]
 struct Opts {
     /// Address to listen on. Bind to the Tailscale address in production.
-    #[arg(long, env = "HOMECLOUD_LISTEN", default_value = "127.0.0.1:8400")]
+    #[arg(long, env = "KILN_LISTEN", default_value = "127.0.0.1:8400")]
     listen: SocketAddr,
-    /// SQLite database path. systemd's StateDirectory gives /var/lib/homecloud.
-    #[arg(long, env = "HOMECLOUD_DB", default_value = "controller.db")]
+    /// SQLite database path. systemd's StateDirectory gives /var/lib/copper.
+    #[arg(long, env = "KILN_DB", default_value = "controller.db")]
     db: PathBuf,
 }
 

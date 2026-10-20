@@ -5,11 +5,12 @@
 - Progress is shown through instance state, not operation IDs.
 - Users choose VM properties, including architecture. The cloud chooses the node; only the admin sees placement.
 - No capacity means an immediate refusal.
-- Controller and agent are plain systemd daemons.
+- Kiln and ingot are plain systemd daemons.
 
-## Controller-agent protocol
-- Controller DB (SQLite) is the source of truth for desired state. The node is the source of truth for observed state.
-- The agent pulls desired state and pushes observed state. The controller never pushes commands.
+## Kiln-ingot protocol
+Kiln is the control plane, ingot the node agent, cu the CLI.
+- Kiln's DB (SQLite) is the source of truth for desired state. The node is the source of truth for observed state.
+- Ingot pulls desired state and pushes observed state. Kiln never pushes commands.
 - Desired instance states: running | stopped | absent. Delete means mark absent; the agent removes VM and disk, reports absent, then the controller drops the row.
 - Every action is idempotent; the controller may resend anything.
 - The agent caches the last desired state on disk and reconciles toward it while the controller is unreachable. Nothing is created or deleted while disconnected.
@@ -43,8 +44,8 @@ Derived from (desired, observed), never stored:
 Failed: the agent retries start with backoff for 5 minutes, then reports failed with the error. Stop then start resets the budget. Stop and delete are allowed from any state.
 
 ## Node side
-- libvirt via `qemu:///system` for v1. Domains carry homecloud metadata; everything else on the host is ignored.
-- Boot disks are qcow2 overlays on base images in `/var/lib/homecloud/images/`, fetched from the controller by hash.
+- libvirt via `qemu:///system` for v1. Domains carry copper metadata; everything else on the host is ignored.
+- Boot disks are qcow2 overlays on base images in `/var/lib/copper/images/`, fetched from the controller by hash.
 
 ## User API
 - Projects group instances. Users have a role of admin or user.

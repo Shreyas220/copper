@@ -1,4 +1,4 @@
-//! homecloud agent: runs on every compute node and reconciles the hypervisor
+//! ingot: runs on every compute node and reconciles the hypervisor
 //! toward the last desired state it received from the controller.
 
 mod identity;
@@ -11,13 +11,13 @@ use std::time::Duration;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "homecloud-agent")]
+#[command(name = "ingot")]
 struct Opts {
-    /// Controller base URL, reached over the tailnet.
-    #[arg(long, env = "HOMECLOUD_CONTROLLER")]
+    /// Kiln base URL, reached over the tailnet.
+    #[arg(long, env = "INGOT_KILN")]
     controller: String,
-    /// State directory. systemd's StateDirectory gives /var/lib/homecloud.
-    #[arg(long, env = "HOMECLOUD_STATE_DIR", default_value = ".")]
+    /// State directory. systemd's StateDirectory gives /var/lib/copper.
+    #[arg(long, env = "INGOT_STATE_DIR", default_value = ".")]
     state_dir: PathBuf,
 }
 
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
 async fn desired_loop(
     _client: reqwest::Client,
     _controller: String,
-    _node_id: homecloud_api::NodeId,
+    _node_id: copper_api::NodeId,
     _state_dir: PathBuf,
 ) -> anyhow::Result<()> {
     loop {
@@ -68,7 +68,7 @@ async fn desired_loop(
 async fn report_loop(
     _client: reqwest::Client,
     _controller: String,
-    _node_id: homecloud_api::NodeId,
+    _node_id: copper_api::NodeId,
 ) -> anyhow::Result<()> {
     loop {
         // TODO: snapshot hypervisor, POST /nodes/{id}/observed. Only the latest matters.

@@ -39,7 +39,7 @@ Derived from (desired, observed), never stored:
 | stopped | stopped, absent     | stopped   |
 | absent  | not absent          | deleting  |
 | absent  | absent              | removed   |
-| any     | node offline        | unknown   |
+| any     | node offline        | unknown, unless observed is failed, which stays failed |
 
 Failed: the agent retries start with backoff for 5 minutes, then reports failed with the error. Stop then start resets the budget. Stop and delete are allowed from any state.
 

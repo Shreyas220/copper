@@ -20,10 +20,15 @@ impl InstanceState {
     pub fn derive(desired: DesiredState, observed: Option<ObservedState>, node_online: bool) -> Self {
         use DesiredState as D;
         use ObservedState as O;
+        let observed = observed.unwrap_or(O::Absent);
+        // A failure the node already reported stays visible even if the node
+        // has since gone offline or been retired.
+        if observed == O::Failed && desired != D::Absent {
+            return Self::Failed;
+        }
         if !node_online {
             return Self::Unknown;
         }
-        let observed = observed.unwrap_or(O::Absent);
         match (desired, observed) {
             (D::Absent, _) => Self::Deleting,
             (D::Running, O::Running) => Self::Running,
@@ -111,5 +116,7 @@ mod tests {
         assert_eq!(S::derive(D::Stopped, None, true), S::Stopped);
         assert_eq!(S::derive(D::Absent, Some(O::Running), true), S::Deleting);
         assert_eq!(S::derive(D::Running, Some(O::Running), false), S::Unknown);
+        assert_eq!(S::derive(D::Running, Some(O::Failed), false), S::Failed);
+        assert_eq!(S::derive(D::Absent, Some(O::Failed), true), S::Deleting);
     }
 }

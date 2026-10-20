@@ -22,8 +22,9 @@ use crate::reconcile::Reconciler;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ingot", version)]
 struct Opts {
-    /// Kiln base URL, reached over the tailnet.
-    #[arg(long, env = "INGOT_KILN")]
+    /// Kiln base URL. The default relies on the kiln machine being named
+    /// `kiln` on the tailnet, so MagicDNS resolves it from anywhere.
+    #[arg(long, env = "INGOT_KILN", default_value = "http://kiln:8400")]
     kiln: String,
     /// State directory: node id, cached desired state, disks.
     /// systemd's StateDirectory gives /var/lib/copper.

@@ -1,0 +1,22 @@
+[Unit]
+Description=copper control plane (kiln)
+Documentation=https://github.com/Shreyas220/copper
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=copper
+Group=copper
+StateDirectory=copper
+EnvironmentFile=-/etc/copper/kiln.env
+Environment=KILN_DB=/var/lib/copper/kiln.db
+ExecStart=/usr/local/bin/kiln serve
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

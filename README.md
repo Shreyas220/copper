@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-An Oxide-style mini cloud for a couple of home machines. Rust, plain systemd daemons.
+An Oxide inspired mini cloud for a couple of home machines. Rust, plain systemd daemons.
 
 - `kiln/`   the control plane: SQLite source of truth, placement, user API
 - `ingot/`  the node agent: runs on every compute node, reconciles libvirt toward desired state
@@ -13,3 +13,30 @@ An Oxide-style mini cloud for a couple of home machines. Rust, plain systemd dae
 - `api/`    wire types shared by all three
 
 See `docs/design.md` for the decisions so far.
+
+## Install
+
+One machine runs kiln. Name it `kiln` on your tailnet so every node finds it by default.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shreyas220/copper/main/install.sh | sudo sh -s -- kiln
+sudo -u copper kiln --db /var/lib/copper/kiln.db token --user you --role admin
+```
+
+Every compute node runs ingot. It needs libvirt, `qemu-utils` and `cloud-image-utils`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shreyas220/copper/main/install.sh | sudo sh -s -- ingot
+```
+
+Then approve the node and make a VM:
+
+```sh
+export CU_URL=http://kiln:8400 CU_TOKEN=cu_...
+cu node ls && cu node approve <id>
+cu project create default
+cu create web --vcpus 2 --memory 2048
+cu ls
+```
+
+`install.sh --help` lists the options, including `--binaries target/release` to install a local build.

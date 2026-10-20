@@ -1,0 +1,22 @@
+[Unit]
+Description=copper node agent (ingot)
+Documentation=https://github.com/Shreyas220/copper
+After=network-online.target libvirtd.service tailscaled.service
+Wants=network-online.target
+Requires=libvirtd.service
+
+[Service]
+User=copper
+Group=copper
+SupplementaryGroups=libvirt kvm
+StateDirectory=copper
+EnvironmentFile=-/etc/copper/ingot.env
+Environment=INGOT_STATE_DIR=/var/lib/copper
+ExecStart=/usr/local/bin/ingot
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

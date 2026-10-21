@@ -671,6 +671,8 @@ dependencies = [
  "clap",
  "copper-api",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "rand",
  "rusqlite",
  "serde",

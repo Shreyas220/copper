@@ -21,6 +21,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/projects/{project}/instances/{name}/start", post(start_instance))
         .route("/v1/projects/{project}/instances/{name}/stop", post(stop_instance))
         .route("/v1/projects/{project}/instances/{name}/resize", post(resize_instance))
+        .route("/v1/projects/{project}/instances/{name}/ssh", get(ssh_tunnel))
         .route("/v1/instances/{id}/forget", post(forget_instance))
         .route("/v1/images", get(list_images))
         .route("/v1/nodes", get(list_nodes))
@@ -219,6 +220,88 @@ async fn resize_instance(
     }
     let row = db::instance(&conn, row.id)?.ok_or_else(|| Error::not_found("instance"))?;
     Ok(Json(to_api(&conn, row, &project, admin)?))
+}
+
+/// HTTP upgrade protocol for `cu ssh`: after `101`, the connection carries
+/// raw bytes to and from the instance's SSH port.
+pub const TUNNEL_PROTOCOL: &str = "copper-tcp";
+const SSH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Relay the caller to their running instance's SSH port, so `cu ssh` works
+/// from anywhere cu reaches kiln, the tailnet included, without routing the
+/// home LAN onto the tailnet. Only the project's owner (or an admin) gets in,
+/// and SSH itself still authenticates the key.
+async fn ssh_tunnel(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path((project, name)): Path<(String, String)>,
+    mut req: axum::extract::Request,
+) -> Result<axum::response::Response> {
+    use axum::http::header::{CONNECTION, UPGRADE};
+    if req.headers().get(UPGRADE).and_then(|v| v.to_str().ok()) != Some(TUNNEL_PROTOCOL) {
+        return Err(Error(StatusCode::UPGRADE_REQUIRED, format!("this endpoint needs Upgrade: {TUNNEL_PROTOCOL}; use cu ssh")));
+    }
+    let (id, candidates) = {
+        let conn = state.db.lock().unwrap();
+        let row = load(&conn, &auth, &project, &name)?;
+        let id = row.id;
+        let inst = to_api(&conn, row, &project, false)?;
+        if inst.state != InstanceState::Running {
+            let state = serde_json::to_string(&inst.state)?;
+            return Err(Error::conflict(format!("instance is {}, not running", state.trim_matches('"'))));
+        }
+        let candidates: Vec<std::net::IpAddr> = inst.addresses.iter().filter_map(|a| a.parse().ok()).filter(|ip| relay_allowed(*ip)).collect();
+        (id, candidates)
+    };
+    if candidates.is_empty() {
+        return Err(Error::conflict("instance has no LAN address yet; try again once it has booted"));
+    }
+    // A guest can report several addresses (docker bridges, say); take the
+    // first that answers on port 22.
+    let mut stream = None;
+    for ip in &candidates {
+        let target = std::net::SocketAddr::new(*ip, 22);
+        if let Ok(Ok(s)) = tokio::time::timeout(SSH_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
+            stream = Some((s, target));
+            break;
+        }
+    }
+    let Some((mut stream, target)) = stream else {
+        return Err(Error(StatusCode::BAD_GATEWAY, "the instance's SSH port does not answer yet".into()));
+    };
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let user = auth.0.name.clone();
+    tracing::info!(%user, instance = %id, %target, "ssh tunnel opened");
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let mut client = hyper_util::rt::TokioIo::new(upgraded);
+                let result = tokio::io::copy_bidirectional(&mut client, &mut stream).await;
+                tracing::info!(%user, instance = %id, ?result, "ssh tunnel closed");
+            }
+            Err(e) => tracing::warn!(%user, instance = %id, error = %e, "ssh tunnel upgrade failed"),
+        }
+    });
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(CONNECTION, "upgrade")
+        .header(UPGRADE, TUNNEL_PROTOCOL)
+        .body(axum::body::Body::empty())
+        .map_err(|e| Error::from(anyhow::Error::from(e)))?)
+}
+
+/// Guest agents report addresses, so they are untrusted. Relay only to
+/// private LAN addresses that aren't this host's own: nothing a bridged
+/// guest couldn't reach by itself. Loopback, the tailnet and link-local
+/// addresses are never targets.
+pub fn relay_allowed(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let private = match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 && !crate::trusted_network(ip),
+    };
+    // Binding succeeds only for an address assigned to this host.
+    private && std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).is_err()
 }
 
 async fn list_images(State(state): State<AppState>, _auth: Auth) -> Result<Json<Vec<Image>>> {

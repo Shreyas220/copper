@@ -10,6 +10,7 @@ Goals for copper, in the order they make sense to build. [design.md](design.md) 
 - [x] LAN binding for kiln: several listen addresses and `install.sh kiln --lan`, with a warning for plain HTTP outside loopback and the tailnet. TLS itself is still to do.
 - [x] Images fetched from kiln by hash. Kiln holds the catalogue, nodes download and verify once.
 - [x] macOS installer parity: kiln, ingot and cu for Apple silicon in the release, and `prepare.sh --update` to update in place.
+- [x] SSH into your own VMs from anywhere: `cu ssh` and `cu ssh-config`, tunnelled through kiln.
 
 ## Scheduling and capacity
 

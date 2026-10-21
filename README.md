@@ -49,6 +49,8 @@ cu node ls && cu node approve <id>
 cu project create default
 cu create web --vcpus 2 --memory 2048
 cu ls
+cu ssh web                         # through kiln, so it works over the tailnet too
+cu ssh-config web >> ~/.ssh/config # then: scp file web.copper:
 cu stop web && cu resize web --memory 4096 --disk 20 && cu start web
 cu node set <id> --cpu-ratio 4     # admin: let 8 threads back 32 vCPUs
 ```

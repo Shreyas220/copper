@@ -90,3 +90,10 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - Kiln binds the Tailscale address by default. The tailnet is the trust boundary for v1.
 - `--listen` takes several addresses, so kiln can also serve the home LAN (`install.sh kiln --lan`). That is plain HTTP: user and node bearer tokens cross the LAN unencrypted, and kiln logs a warning for every listener outside loopback and the tailnet. TLS is not built.
 - `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.
+
+## SSH access
+- Guests sit on the home LAN, which the tailnet does not route. `cu ssh <name>` reaches them anyway by tunnelling through kiln, so it works wherever cu reaches kiln.
+- cu runs `ssh` with itself as the ProxyCommand. That opens `GET /v1/projects/{p}/instances/{name}/ssh` with `Upgrade: copper-tcp`; kiln checks the caller owns the project (or is admin) and that the instance is running, connects to port 22 on one of its addresses, and relays bytes after `101 Switching Protocols`. SSH still authenticates the key injected at creation.
+- The tunnel only ever targets port 22. Addresses come from the guest agent, so a guest controls them: kiln only relays to private LAN addresses that are not its own, never to loopback, link-local or tailnet addresses. That reaches nothing a bridged guest couldn't reach itself.
+- Host keys are remembered under `copper-<instance id>`, because LAN addresses get reused but instance ids never do.
+- `cu ssh-config <name>` prints a `Host <name>.copper` entry for scp, rsync and editors. Its ProxyCommand reads `CU_TOKEN` from the environment; the token is never written to the file or passed as an argument.

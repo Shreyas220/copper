@@ -67,6 +67,27 @@ enum Cmd {
         #[arg(long)]
         disk: Option<u64>,
     },
+    /// SSH into a running instance, tunnelled through kiln so it works
+    /// wherever cu does, the tailnet included
+    Ssh {
+        name: String,
+        /// Login user. Ubuntu cloud images use `ubuntu`.
+        #[arg(long, short = 'l', default_value = "ubuntu")]
+        user: String,
+        /// Remote command to run instead of a shell.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Print an ssh_config entry so ssh, scp and rsync reach an instance as
+    /// <name>.copper. The tunnel reads CU_TOKEN from the environment.
+    SshConfig {
+        name: String,
+        #[arg(long, short = 'l', default_value = "ubuntu")]
+        user: String,
+    },
+    /// Relay stdin and stdout to an instance's SSH port (ssh's ProxyCommand)
+    #[command(hide = true)]
+    Tunnel { name: String },
     /// Base images in kiln's catalogue
     #[command(subcommand)]
     Image(ImageCmd),
@@ -105,6 +126,57 @@ enum NodeCmd {
 #[derive(Subcommand)]
 enum ImageCmd {
     Ls,
+}
+
+/// Quote for the shell ssh runs ProxyCommand with, and escape ssh's own `%` tokens.
+fn proxy_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''").replace('%', "%%"))
+}
+
+/// The ProxyCommand that tunnels to `name` through kiln.
+fn proxy_command(url: &str, project: &str, name: &str) -> anyhow::Result<String> {
+    let exe = std::env::current_exe().context("locating the cu binary")?;
+    Ok(format!(
+        "{} --url {} --project {} tunnel {}",
+        proxy_quote(&exe.to_string_lossy()), proxy_quote(url), proxy_quote(project), proxy_quote(name)
+    ))
+}
+
+async fn running_instance(c: &Client, project: &str, name: &str) -> anyhow::Result<Instance> {
+    let i: Instance = c.call(Method::GET, &format!("/v1/projects/{project}/instances/{name}"), None).await?;
+    if i.state != InstanceState::Running {
+        bail!("{name} is {}; it must be running", serde_json::to_string(&i.state)?.trim_matches('"'));
+    }
+    Ok(i)
+}
+
+/// Upgrade an HTTP request to kiln into a byte stream to the instance's SSH
+/// port, then shuttle stdin and stdout across it.
+async fn tunnel(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let resp = c.http
+        .get(format!("{}/v1/projects/{project}/instances/{name}/ssh", c.url))
+        .bearer_auth(&c.token)
+        .header(reqwest::header::CONNECTION, "upgrade")
+        .header(reqwest::header::UPGRADE, "copper-tcp")
+        .send()
+        .await
+        .context("connecting to kiln")?;
+    let status = resp.status();
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        let text = resp.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<ApiError>(&text).map(|e| e.message).unwrap_or(text);
+        bail!("{status}: {msg}");
+    }
+    let (mut from_vm, mut to_vm) = tokio::io::split(resp.upgrade().await.context("opening the tunnel")?);
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut to_vm).await;
+        let _ = to_vm.shutdown().await;
+    });
+    let mut stdout = tokio::io::stdout();
+    tokio::io::copy(&mut from_vm, &mut stdout).await?;
+    stdout.flush().await?;
+    Ok(())
 }
 
 fn print_node(n: &Node) -> anyhow::Result<()> {
@@ -240,6 +312,39 @@ async fn main() -> anyhow::Result<()> {
             let body = serde_json::to_value(ResizeInstance { vcpus, memory_mb: memory, disk_gb: disk })?;
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/resize"), Some(body)).await?;
             print_instance(&i);
+        }
+        Cmd::Ssh { name, user, command } => {
+            let i = running_instance(&c, p, &name).await?;
+            let mut ssh = std::process::Command::new("ssh");
+            // The token reaches the ProxyCommand through the environment,
+            // never through arguments other users could see in ps.
+            ssh.env("CU_TOKEN", &c.token)
+                .arg("-o").arg(format!("ProxyCommand={}", proxy_command(&c.url, p, &name)?))
+                // Addresses get reused; the instance id never does.
+                .arg("-o").arg(format!("HostKeyAlias=copper-{}", i.id))
+                .arg("-o").arg("StrictHostKeyChecking=accept-new")
+                .arg("-l").arg(&user)
+                .arg(&name)
+                .args(&command);
+            // Hand the terminal and signals to ssh.
+            let err = std::os::unix::process::CommandExt::exec(&mut ssh);
+            bail!("running ssh: {err}");
+        }
+        Cmd::SshConfig { name, user } => {
+            let i: Instance = c.call(Method::GET, &format!("/v1/projects/{p}/instances/{name}"), None).await?;
+            println!("Host {name}.copper");
+            println!("    User {user}");
+            println!("    HostKeyAlias copper-{}", i.id);
+            println!("    StrictHostKeyChecking accept-new");
+            println!("    ProxyCommand {}", proxy_command(&c.url, p, &name)?);
+        }
+        Cmd::Tunnel { name } => {
+            if let Err(e) = tunnel(&c, p, &name).await {
+                eprintln!("cu: {e:#}");
+                std::process::exit(1);
+            }
+            // stdin is read on a blocking thread that would hold the runtime open.
+            std::process::exit(0);
         }
         Cmd::Image(ImageCmd::Ls) => {
             let v: Vec<Image> = c.call(Method::GET, "/v1/images", None).await?;

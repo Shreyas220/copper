@@ -77,6 +77,41 @@ impl Drop for Fixture {
     }
 }
 
+#[tokio::test]
+async fn ssh_tunnel_needs_the_owner_a_running_instance_and_a_lan_address() {
+    let f = Fixture::new();
+    let (_, vm) = f.create("vm").await;
+    let id = vm["id"].as_str().unwrap().to_string();
+    let path = "/v1/projects/default/instances/vm/ssh";
+    let tunnel = |token: &str, path: &str| {
+        Request::builder().uri(path).header("authorization", format!("Bearer {token}"))
+            .header("connection", "upgrade").header("upgrade", user_api::TUNNEL_PROTOCOL).body(Body::empty()).unwrap()
+    };
+    let status = |req: Request<Body>| async { f.app.clone().oneshot(req).await.unwrap().status() };
+    assert_eq!(f.call("GET", path, &f.user, Value::Null).await.0, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(status(tunnel("nope", path)).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(tunnel(&f.user, path)).await, StatusCode::CONFLICT); // still starting
+    assert_eq!(status(tunnel(&f.user, "/v1/projects/admin:default/instances/vm/ssh")).await, StatusCode::FORBIDDEN);
+    // A guest that reports loopback or a tailnet address must not reach the host or the tailnet.
+    let report = json!({"generation_seen":f.generation(),"instances":[{"id":id,"state":"running","addresses":["127.0.0.1","100.75.219.83"]}],
+        "capacity":{"vcpus":1,"memory_mb":1024,"disk_gb":10}});
+    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report).await.0, StatusCode::OK);
+    let resp = f.app.clone().oneshot(tunnel(&f.user, path)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+    assert!(body["message"].as_str().unwrap().contains("no LAN address"));
+}
+
+#[test]
+fn tunnel_targets_are_private_lan_addresses_only() {
+    for ok in ["10.255.255.1", "172.31.255.1", "192.168.254.254", "fd12:3456::1"] {
+        assert!(user_api::relay_allowed(ok.parse().unwrap()), "{ok}");
+    }
+    for bad in ["127.0.0.1", "0.0.0.0", "169.254.1.1", "100.75.219.83", "8.8.8.8", "::1", "fd7a:115c:a1e0::1", "fe80::1"] {
+        assert!(!user_api::relay_allowed(bad.parse().unwrap()), "{bad}");
+    }
+}
+
 #[test]
 fn only_loopback_and_the_tailnet_are_trusted_for_plain_http() {
     for ok in ["127.0.0.1", "127.0.0.2", "100.75.219.83", "100.64.0.1", "100.127.255.254", "::1", "fd7a:115c:a1e0::1"] {

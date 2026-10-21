@@ -1,12 +1,16 @@
-//! ingot: the copper node agent. Reconciles libvirt toward the last desired
-//! state received from kiln, and reports what it observes.
+//! ingot: the copper node agent. Reconciles the node's hypervisor toward the
+//! last desired state received from kiln, and reports what it observes.
 
 mod client;
 mod disk;
 mod hv;
 mod identity;
+#[cfg(not(target_os = "macos"))]
+mod libvirt;
 mod reconcile;
 mod state;
+#[cfg(any(target_os = "macos", feature = "tart"))]
+mod tart;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -39,6 +43,11 @@ struct Opts {
     images_dir: Option<PathBuf>,
     #[arg(long, env = "INGOT_LIBVIRT", default_value = "qemu:///system")]
     libvirt: String,
+    /// macOS only: the host interface VMs bridge onto (Tart's --net-bridged).
+    /// On Linux the bridge comes from kiln in each NIC spec.
+    #[arg(long, env = "INGOT_BRIDGE", default_value = "en0")]
+    #[allow(dead_code)]
+    bridge: String,
     /// CPU threads kept back for the host and anything else running on it.
     #[arg(long, env = "INGOT_RESERVE_VCPUS", default_value_t = 2)]
     reserve_vcpus: u32,
@@ -85,7 +94,7 @@ async fn run() -> anyhow::Result<()> {
     let images_dir = opts.images_dir.clone().unwrap_or_else(|| opts.state_dir.join("images"));
 
     let node_id = identity::load_or_create(&opts.state_dir)?;
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string();
+    let hostname = hostname();
     let arch = match std::env::consts::ARCH {
         "x86_64" => Arch::X86_64,
         "aarch64" => Arch::Aarch64,
@@ -93,9 +102,10 @@ async fn run() -> anyhow::Result<()> {
     };
     tracing::info!(%node_id, %hostname, kiln = %opts.kiln, "ingot starting");
 
-    let hv = hv::Libvirt::connect(&opts.libvirt)?;
+    let disks = disk::Disks { dir: opts.state_dir.join("disks"), images: images_dir };
+    let hv = native_hypervisor(&opts, disks)?;
     let reserve = Capacity { vcpus: opts.reserve_vcpus, memory_mb: opts.reserve_memory_mb, disk_gb: opts.reserve_disk_gb };
-    let reconciler = Arc::new(Mutex::new(Reconciler::new(hv, opts.state_dir.join("disks"), images_dir, reserve)));
+    let reconciler = Arc::new(Mutex::new(Reconciler::new(hv, reserve)));
 
     // Loading the cache validates it, but only a fresh authenticated response
     // authorizes resource changes. Existing VMs keep running while disconnected.
@@ -111,6 +121,27 @@ async fn run() -> anyhow::Result<()> {
         result = desired_loop(kiln.clone(), opts.state_dir, cached, register, updates, errors) => result,
         result = reconcile_loop(kiln, rx, failures, reconciler) => result,
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Native> {
+    libvirt::Libvirt::connect(&opts.libvirt, disks)
+}
+
+#[cfg(target_os = "macos")]
+fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Native> {
+    let _ = &opts.libvirt; // meaningless on macOS; accepted so one env file works everywhere
+    tart::Tart::new(disks, opts.bridge.clone())
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).split('.').next().unwrap_or_default().to_string()
 }
 
 async fn snapshot_capacity(reconciler: &Arc<Mutex<Reconciler>>, cached: Option<DesiredNodeState>) -> Capacity {

@@ -58,6 +58,12 @@ Failed: the agent retries start with backoff for 5 minutes, then reports failed 
 - Image names are lowercase filename stems starting with a letter or digit, followed by letters, digits, `.`, `_`, or `-` (maximum 128 bytes). Resolved base-image paths must remain inside the configured images directory. Libvirt lookup failures block disk deletion unless the domain is explicitly confirmed missing.
 - ingot needs a user in the `libvirt` and `kvm` groups, `qemu-img` and `cloud-localds` on the node, and a disks directory that libvirt's qemu user can reach.
 
+## Backends
+The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both storage preparation and the VM lifecycle, so each platform keeps its own disk format. The backend is chosen at compile time by target OS.
+- **libvirt** (Linux): the production backend above.
+- **tart** (macOS, Apple silicon): Apple's Virtualization.framework through the Tart CLI. The boot disk is the cloud image converted to raw under `~/.tart/vms/copper-<id>/`; the seed ISO is built with `hdiutil`. launchd replaces libvirtd for persistence: a running VM has a LaunchAgent whose job is `tart run`, created on start and removed on stop, so running VMs come back after a reboot and login. Guests are aarch64 only, bridged onto a host interface given by `INGOT_BRIDGE` (default `en0`); kiln's per-NIC bridge and MAC are ignored and the address is read back with `tart ip`. The node needs `tart`, `qemu-img`, an arm64 cloud image under the same image name, and a user session that stays logged in. Type-checked on Linux with `cargo check -p ingot --features tart`; not yet run on a Mac.
+- Image names are platform-neutral (`ubuntu-24.04`); each node's file is the build for its own architecture.
+
 ## User API
 - Projects group instances and belong to a user. Users have a role of admin or user. Admins list all projects and address another user's project with `cu --project owner:project ...`; ordinary users can only access their own projects.
 - Auth is API tokens, stored hashed, created by the admin. `kiln token --user NAME` preserves existing roles; only an explicit `--role` changes one. New users default to role `user`.

@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 use copper_api::*;
 
+#[derive(Default)]
 pub struct Disks {
     pub dir: PathBuf,
     pub images: PathBuf,
@@ -103,7 +104,7 @@ impl Disks {
     }
 }
 
-fn user_data_yaml(name: &str, spec: &InstanceSpec) -> String {
+pub fn user_data_yaml(name: &str, spec: &InstanceSpec) -> String {
     let mut y = String::from("#cloud-config\n");
     y.push_str(&format!("hostname: {}\n", serde_json::to_string(name).unwrap()));
     y.push_str("manage_etc_hosts: true\n");
@@ -119,7 +120,7 @@ fn user_data_yaml(name: &str, spec: &InstanceSpec) -> String {
     y
 }
 
-fn run(cmd: &mut Command) -> anyhow::Result<()> {
+pub fn run(cmd: &mut Command) -> anyhow::Result<()> {
     let out = cmd.output().with_context(|| format!("running {:?}", cmd.get_program()))?;
     if !out.status.success() {
         bail!("{:?} failed: {}", cmd.get_program(), String::from_utf8_lossy(&out.stderr).trim());

@@ -7,13 +7,11 @@
 //! desired-absent is irreversible and cleanup must eventually complete.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use copper_api::*;
 
-use crate::disk::Disks;
-use crate::hv::{DomState, Hypervisor, Libvirt};
+use crate::hv::{DomState, Hypervisor};
 
 const FAIL_BUDGET: Duration = Duration::from_secs(5 * 60);
 const RETRY_EVERY: Duration = Duration::from_secs(10);
@@ -35,9 +33,8 @@ impl Failure {
     }
 }
 
-pub struct Reconciler<H = Libvirt> {
+pub struct Reconciler<H = crate::hv::Native> {
     hv: H,
-    disks: Disks,
     reserve: Capacity,
     failures: HashMap<InstanceId, Failure>,
     stop_requested: HashMap<InstanceId, Instant>,
@@ -46,10 +43,9 @@ pub struct Reconciler<H = Libvirt> {
 }
 
 impl<H: Hypervisor> Reconciler<H> {
-    pub fn new(hv: H, disks_dir: PathBuf, images_dir: PathBuf, reserve: Capacity) -> Self {
+    pub fn new(hv: H, reserve: Capacity) -> Self {
         Self {
             hv,
-            disks: Disks { dir: disks_dir, images: images_dir },
             reserve,
             failures: HashMap::new(),
             stop_requested: HashMap::new(),
@@ -67,7 +63,7 @@ impl<H: Hypervisor> Reconciler<H> {
         Capacity {
             vcpus: cpus.saturating_sub(self.reserve.vcpus),
             memory_mb: mem_mb.saturating_sub(self.reserve.memory_mb),
-            disk_gb: self.disks.allocatable_gb(inventory.instances.iter().map(|i| i.id)).saturating_sub(self.reserve.disk_gb),
+            disk_gb: self.hv.allocatable_gb(&inventory.instances.iter().map(|i| i.id).collect::<Vec<_>>()).saturating_sub(self.reserve.disk_gb),
         }
     }
 
@@ -117,9 +113,8 @@ impl<H: Hypervisor> Reconciler<H> {
 
     fn ensure_running(&mut self, inst: &DesiredInstance) -> anyhow::Result<()> {
         self.stop_requested.remove(&inst.id);
-        let disk = self.disks.ensure_disk(inst.id, &inst.spec)?;
-        let seed = self.disks.ensure_seed(inst.id, &inst.name, &inst.spec)?;
-        self.hv.define(inst.id, &inst.spec, &disk, &seed)?;
+        self.hv.prepare(inst)?;
+        self.hv.define(inst)?;
         self.hv.start(inst.id)
     }
 
@@ -143,7 +138,7 @@ impl<H: Hypervisor> Reconciler<H> {
 
     fn ensure_absent(&mut self, id: InstanceId) -> anyhow::Result<()> {
         self.hv.undefine(id)?;
-        self.disks.remove(id)?;
+        self.hv.remove_storage(id)?;
         self.stop_requested.remove(&id);
         Ok(())
     }
@@ -163,7 +158,7 @@ impl<H: Hypervisor> Reconciler<H> {
                 // Never acknowledge deletion while disk cleanup is failing, even
                 // when the domain and boot disk have already been removed.
                 (Ok(None), Some(f)) if inst.state == DesiredState::Absent => (ObservedState::Stopping, Some(f.error.clone())),
-                (Ok(None), _) if self.disks.disk_exists(id) => (ObservedState::Stopped, None),
+                (Ok(None), _) if self.hv.has_storage(id) => (ObservedState::Stopped, None),
                 (Ok(None), _) => (ObservedState::Absent, None),
             };
             let addresses = if state == ObservedState::Running { self.hv.addresses(id) } else { vec![] };
@@ -179,8 +174,11 @@ mod tests {
     use std::cell::RefCell;
     use crate::test_support::TempDir;
 
+    /// A hypervisor that keeps real files for storage (so cleanup semantics
+    /// are exercised) but fakes the VM lifecycle.
     #[derive(Default)]
     struct Fake {
+        disks: crate::disk::Disks,
         state: RefCell<Option<DomState>>,
         fail_lookup: bool,
         fail_delete: bool,
@@ -189,11 +187,15 @@ mod tests {
     }
     impl Hypervisor for Fake {
         fn node_capacity(&self) -> anyhow::Result<(u32, u64)> { Ok((8, 16384)) }
+        fn allocatable_gb(&self, ids: &[InstanceId]) -> u64 { self.disks.allocatable_gb(ids.iter().copied()) }
+        fn prepare(&self, _: &DesiredInstance) -> anyhow::Result<()> { Ok(()) }
+        fn has_storage(&self, id: InstanceId) -> bool { self.disks.disk_exists(id) }
+        fn remove_storage(&self, id: InstanceId) -> anyhow::Result<()> { self.disks.remove(id) }
         fn state(&self, _: InstanceId) -> anyhow::Result<Option<DomState>> {
             if self.fail_lookup { anyhow::bail!("libvirt disconnected") }
             Ok(*self.state.borrow())
         }
-        fn define(&self, _: InstanceId, _: &InstanceSpec, _: &std::path::Path, _: &std::path::Path) -> anyhow::Result<()> { Ok(()) }
+        fn define(&self, _: &DesiredInstance) -> anyhow::Result<()> { Ok(()) }
         fn start(&self, _: InstanceId) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("start");
             if self.fail_start { anyhow::bail!("start failed") }
@@ -223,8 +225,9 @@ mod tests {
             },
         }] }
     }
-    fn reconciler(dir: &TempDir, hv: Fake) -> Reconciler<Fake> {
-        Reconciler::new(hv, dir.path().to_owned(), dir.path().to_owned(), Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 })
+    fn reconciler(dir: &TempDir, mut hv: Fake) -> Reconciler<Fake> {
+        hv.disks = crate::disk::Disks { dir: dir.path().to_owned(), images: dir.path().to_owned() };
+        Reconciler::new(hv, Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 })
     }
     #[test]
     fn stopped_instance_deleted_after_restart_is_reported_repeatedly() {
@@ -250,7 +253,7 @@ mod tests {
         let dir = TempDir::new();
         let mut r = reconciler(&dir, Fake { fail_lookup: true, ..Fake::default() });
         let d = snapshot(DesiredState::Absent);
-        let path = r.disks.disk_path(d.instances[0].id);
+        let path = r.hv.disks.disk_path(d.instances[0].id);
         std::fs::write(&path, "valuable disk").unwrap();
         r.reconcile(&d);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "valuable disk");
@@ -262,7 +265,7 @@ mod tests {
         let mut r = reconciler(&dir, Fake::default());
         let d = snapshot(DesiredState::Absent);
         // An unremovable seed simulates failure after boot-disk removal.
-        std::fs::create_dir(r.disks.seed_path(d.instances[0].id)).unwrap();
+        std::fs::create_dir(r.hv.disks.seed_path(d.instances[0].id)).unwrap();
         r.reconcile(&d);
         assert_ne!(r.observe().instances[0].state, ObservedState::Absent);
     }
@@ -272,8 +275,8 @@ mod tests {
         let mut r = reconciler(&dir, Fake { fail_start: true, ..Fake::default() });
         let mut d = snapshot(DesiredState::Running);
         let id = d.instances[0].id;
-        std::fs::write(r.disks.disk_path(id), "disk").unwrap();
-        std::fs::write(r.disks.seed_path(id), "seed").unwrap();
+        std::fs::write(r.hv.disks.disk_path(id), "disk").unwrap();
+        std::fs::write(r.hv.disks.seed_path(id), "seed").unwrap();
         r.reconcile(&d);
         r.failures.get_mut(&id).unwrap().since = Instant::now() - FAIL_BUDGET;
         r.reconcile(&d);
@@ -303,7 +306,7 @@ mod tests {
         let dir = TempDir::new();
         let d = snapshot(DesiredState::Absent);
         let r = reconciler(&dir, Fake { state: RefCell::new(Some(DomState::Running)), ..Fake::default() });
-        let path = r.disks.disk_path(d.instances[0].id);
+        let path = r.hv.disks.disk_path(d.instances[0].id);
         std::fs::write(&path, "valuable disk").unwrap();
         let r = std::sync::Arc::new(std::sync::Mutex::new(r));
         assert!(crate::reconcile_snapshot(r.clone(), None).await.unwrap().is_none());
@@ -320,7 +323,7 @@ mod tests {
         let mut r = reconciler(&dir, Fake { fail_delete: true, ..Fake::default() });
         let d = snapshot(DesiredState::Absent);
         let id = d.instances[0].id;
-        let path = r.disks.disk_path(id);
+        let path = r.hv.disks.disk_path(id);
         std::fs::write(&path, "valuable disk").unwrap();
         r.reconcile(&d);
         let failure = r.failures.get_mut(&id).unwrap();

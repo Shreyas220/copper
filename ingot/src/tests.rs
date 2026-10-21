@@ -181,8 +181,12 @@ async fn stale_report_failure_cannot_revoke_a_newer_response_for_the_same_genera
 struct EmptyHypervisor;
 impl hv::Hypervisor for EmptyHypervisor {
     fn node_capacity(&self) -> anyhow::Result<(u32, u64)> { Ok((4, 8192)) }
+    fn allocatable_gb(&self, _: &[InstanceId]) -> u64 { 0 }
+    fn prepare(&self, _: &DesiredInstance) -> anyhow::Result<()> { unreachable!() }
+    fn has_storage(&self, _: InstanceId) -> bool { false }
+    fn remove_storage(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
     fn state(&self, _: InstanceId) -> anyhow::Result<Option<hv::DomState>> { unreachable!() }
-    fn define(&self, _: InstanceId, _: &InstanceSpec, _: &std::path::Path, _: &std::path::Path) -> anyhow::Result<()> { unreachable!() }
+    fn define(&self, _: &DesiredInstance) -> anyhow::Result<()> { unreachable!() }
     fn start(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
     fn shutdown(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
     fn destroy(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
@@ -193,7 +197,8 @@ impl hv::Hypervisor for EmptyHypervisor {
 #[tokio::test]
 async fn worker_reports_old_failures_without_overwriting_new_desired_state() {
     let dir = test_support::TempDir::new();
-    let reconciler = Arc::new(Mutex::new(Reconciler::new(EmptyHypervisor, dir.path().into(), dir.path().into(), Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 })));
+    let _ = &dir;
+    let reconciler = Arc::new(Mutex::new(Reconciler::new(EmptyHypervisor, Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 })));
     let (client, mut calls) = mpsc::unbounded_channel();
     let (updates, state) = watch::channel(ControllerState { revision: 1, desired: Some(snapshot()) });
     let (failures, mut errors) = mpsc::channel(1);

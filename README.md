@@ -29,6 +29,12 @@ Every compute node runs ingot. It needs libvirt, `qemu-utils` and `cloud-image-u
 curl -fsSL https://raw.githubusercontent.com/Shreyas220/copper/main/install.sh | sudo sh -s -- ingot
 ```
 
+An Apple silicon Mac becomes a node with Tart instead of libvirt. Run this as the user that stays logged in; it installs Homebrew, Tart, QEMU and ingot as a LaunchAgent:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shreyas220/copper/main/dist/macos/prepare.sh | sh -s -- --kiln http://kiln:8400
+```
+
 Then approve the node and make a VM:
 
 ```sh

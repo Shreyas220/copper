@@ -12,7 +12,7 @@ An Oxide inspired mini cloud for a couple of home machines. Rust, plain systemd 
 - `cu/`     the command line client
 - `api/`    wire types shared by all three
 
-See `docs/design.md` for the decisions so far.
+See `docs/design.md` for the decisions so far and `docs/roadmap.md` for what comes next.
 
 ## Install
 

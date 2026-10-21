@@ -13,23 +13,30 @@ jobs:
         include:
           - runner: ubuntu-24.04
             arch: x86_64
+            os: linux
           - runner: ubuntu-24.04-arm
             arch: aarch64
+            os: linux
+          # Apple silicon: ingot (Tart backend) and cu. No libvirt here.
+          - runner: macos-14
+            arch: aarch64
+            os: darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
+      - if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - name: package
         run: |
           mkdir -p out
           cp target/release/kiln target/release/ingot target/release/cu out/
-          tar -czf copper-${{ matrix.arch }}-linux.tar.gz -C out kiln ingot cu
+          tar -czf copper-${{ matrix.arch }}-${{ matrix.os }}.tar.gz -C out kiln ingot cu
       - uses: actions/upload-artifact@v4
         with:
-          name: copper-${{ matrix.arch }}-linux
-          path: copper-${{ matrix.arch }}-linux.tar.gz
+          name: copper-${{ matrix.arch }}-${{ matrix.os }}
+          path: copper-${{ matrix.arch }}-${{ matrix.os }}.tar.gz
 
   release:
     needs: build
@@ -40,5 +47,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: copper-*-linux.tar.gz
+          files: copper-*.tar.gz
           generate_release_notes: true

@@ -92,7 +92,7 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.
 
 ## SSH access
-- Guests sit on the home LAN, which the tailnet does not route. `cu ssh <name>` reaches them anyway by tunnelling through kiln, so it works wherever cu reaches kiln.
+- Guests sit on the home LAN, which the tailnet does not route, and that stays so: the home LAN is not shared onto the tailnet with a subnet route. Over the tailnet, `cu ssh <name>` reaches guests by tunnelling through kiln. At home, plain `ssh ubuntu@<address>` works too.
 - cu runs `ssh` with itself as the ProxyCommand. That opens `GET /v1/projects/{p}/instances/{name}/ssh` with `Upgrade: copper-tcp`; kiln checks the caller owns the project (or is admin) and that the instance is running, connects to port 22 on one of its addresses, and relays bytes after `101 Switching Protocols`. SSH still authenticates the key injected at creation.
 - The tunnel only ever targets port 22. Addresses come from the guest agent, so a guest controls them: kiln only relays to private LAN addresses that are not its own, never to loopback, link-local or tailnet addresses. That reaches nothing a bridged guest couldn't reach itself.
 - Host keys are remembered under `copper-<instance id>`, because LAN addresses get reused but instance ids never do.

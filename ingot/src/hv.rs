@@ -44,6 +44,10 @@ pub trait Hypervisor {
     fn destroy(&self, id: InstanceId) -> anyhow::Result<()>;
     /// Forget the VM. Storage is handled separately by `remove_storage`.
     fn undefine(&self, id: InstanceId) -> anyhow::Result<()>;
+    /// Bring a defined VM that is not running up to the spec's vCPUs, memory
+    /// and disk size. Disks only grow; the guest's cloud-init grows its root
+    /// filesystem on the next boot. Only called while the VM is off.
+    fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()>;
 
     /// `Ok(None)` when the platform has no such VM. `Err` when the platform
     /// itself can't be asked, which must never be mistaken for absence.

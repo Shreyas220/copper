@@ -95,6 +95,23 @@ impl Libvirt {
         Ok(())
     }
 
+    /// Redefine an inactive domain whose vCPUs or memory differ from the
+    /// spec, then grow its disk. Redefining only when needed keeps libvirt's
+    /// device addresses stable.
+    pub fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()> {
+        let d = self.lookup(inst.id)?.ok_or_else(|| anyhow!("domain missing"))?;
+        if d.is_active().map_err(err)? {
+            anyhow::bail!("domain is running; resize applies after it stops");
+        }
+        let info = d.get_info().map_err(err)?;
+        if info.max_mem != inst.spec.memory_mb * 1024 || info.nr_virt_cpu != inst.spec.vcpus {
+            let xml = domain_xml(inst.id, &inst.spec, &self.disks.disk_path(inst.id), &self.disks.seed_path(inst.id));
+            Domain::define_xml(&self.conn, &xml).map_err(err).context("redefining domain")?;
+            tracing::info!(instance = %inst.id, vcpus = inst.spec.vcpus, memory_mb = inst.spec.memory_mb, "domain resized");
+        }
+        self.disks.grow(inst.id, inst.spec.boot_disk.size_gb)
+    }
+
     pub fn undefine(&self, id: InstanceId) -> anyhow::Result<()> {
         let Some(d) = self.lookup(id)? else { return Ok(()) };
         if d.is_active().map_err(err)? {
@@ -222,6 +239,7 @@ impl Hypervisor for Libvirt {
     fn shutdown(&self, id: InstanceId) -> anyhow::Result<()> { self.shutdown(id) }
     fn destroy(&self, id: InstanceId) -> anyhow::Result<()> { self.destroy(id) }
     fn undefine(&self, id: InstanceId) -> anyhow::Result<()> { self.undefine(id) }
+    fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()> { self.reconfigure(inst) }
     fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>> { self.state(id) }
     fn addresses(&self, id: InstanceId) -> Vec<String> { self.addresses(id) }
 }

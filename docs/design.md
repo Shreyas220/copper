@@ -49,22 +49,44 @@ Failed: the agent retries start with backoff for 5 minutes, then reports failed 
 
 ## Node side
 - libvirt via `qemu:///system` for v1. Copper domains are named `copper-<instance id>`; everything else on the host is ignored.
-- Boot disks are qcow2 overlays on base images. Images live in `<state dir>/images/<name>.img` for now; fetching them from kiln by hash is still to do.
+- Boot disks are qcow2 overlays on base images. Base images come from kiln's catalogue by hash (see Images); a node-local `<state dir>/images/<name>.img` is used only when kiln has no catalogue entry for the name and arch.
 - cloud-init seed ISO carries the hostname, SSH keys, and installs `qemu-guest-agent`. Addresses come from the agent once it's up, with the host ARP table as a fallback before that.
 - Stop is ACPI shutdown, then destroy after 60 s if the guest ignores it.
 - A reconciliation timer runs every 10 s independently of long-poll responses. Failed starts and stops retry for 5 min, then the instance reports `failed` until its desired state changes. Deletes retry every 10 s indefinitely while connected; exhausting the failure budget makes the error visible but does not stop cleanup retries.
-- Capacity reported to kiln is host threads and memory minus a configurable reserve (default 2 threads, 4 GB) for the host itself.
+- Capacity reported to kiln is host threads and memory minus a configurable reserve (default 2 threads, 4 GB) for the host itself. The reserve is node configuration; overcommit is kiln policy (see Placement).
+- Resize: a VM that is off is brought up to its spec before it starts and while it stays stopped. vCPUs and memory are redefined only when they differ; disks only grow, and cloud-init grows the guest's root filesystem on the next boot. Applied sizes are cached per process, so an unchanged spec costs nothing per tick.
 - The disk budget is current filesystem free space plus physical blocks allocated to boot disks in the reconciled desired snapshot. Kiln subtracts the full virtual disk reservations once. Unrelated host usage reduces the budget, and orphaned disks are not added back. `INGOT_RESERVE_DISK_GB` optionally reserves additional host headroom (default 0 GiB). Registration preserves the last observed capacity of known nodes; only a report for the current generation refreshes it. All resources remain reserved until confirmed deletion. This admission budget is not a filesystem quota; external disk growth can still exhaust the filesystem.
 - Image names are lowercase filename stems starting with a letter or digit, followed by letters, digits, `.`, `_`, or `-` (maximum 128 bytes). Resolved base-image paths must remain inside the configured images directory. Libvirt lookup failures block disk deletion unless the domain is explicitly confirmed missing.
 - ingot needs a user in the `libvirt` and `kvm` groups, `qemu-img` and `cloud-localds` on the node, and a disks directory that libvirt's qemu user can reach.
+
+## Images
+- Kiln keeps a content-addressed catalogue: blobs at `<db dir>/catalog/<sha256>.img`, and a table mapping a platform-neutral name and an arch to a blob. `kiln image import --name ubuntu-24.04 --arch x86_64 FILE` adds one; only qcow2 files are accepted. `install.sh kiln` imports Ubuntu 24.04 for its own arch, or for `--image-arch` arches.
+- Creating an instance binds the name to the blob's hash in its spec. Re-importing a name later never changes existing instances.
+- Nodes fetch a missing blob with `GET /nodes/{id}/images/{sha256}` using their node credential, verify the hash while writing, and publish it to `<images dir>/sha256/<hash>.img` only if it matched. Kiln serves only blobs that the catalogue or an instance still refers to.
+- Downloads run in their own task, one at a time, so reconciliation and reports continue meanwhile. An instance waiting for its image reports `starting` with a note and does not spend its failure budget; a failed download is retried on the next reconcile.
+
+## Placement
+- Each node admits its reported capacity times a per-node overcommit ratio for CPU, memory and disk (default 1.0 each, at most 64). The admin sets them with `cu node set <id> --cpu-ratio 4`. Lowering a ratio below what is allocated evicts nothing; it only stops new placements.
+- Among nodes that fit, kiln prefers the most free memory.
+- Admin-only hints: `--node <id>` places on exactly that node or refuses; `--spread <group>` prefers nodes holding the fewest instances of that group in the project. Spread is soft and never refuses on its own.
+- Resize changes a stopped instance in place. It must fit on its own node once its current allocation is released, or it is refused; instances never move.
 
 ## Backends
 The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both storage preparation and the VM lifecycle, so each platform keeps its own disk format. The backend is chosen at compile time by target OS.
 - **libvirt** (Linux): the production backend above.
 - **tart** (macOS, Apple silicon): Apple's Virtualization.framework through the Tart CLI. The boot disk is the cloud image converted to raw under `~/.tart/vms/copper-<id>/`; the seed ISO is built with `hdiutil`. launchd replaces libvirtd for persistence: a running VM has a LaunchAgent whose job is `tart run`, created on start and removed on stop, so running VMs come back after a reboot and login. Guests are aarch64 only, bridged onto a host interface given by `INGOT_BRIDGE` (default `en0`); kiln's per-NIC bridge and MAC are ignored and the address is read back with `tart ip`. The node needs `tart`, `qemu-img`, an arm64 cloud image under the same image name, and a user session that stays logged in. Type-checked on Linux with `cargo check -p ingot --features tart`; not yet run on a Mac.
-- Image names are platform-neutral (`ubuntu-24.04`); each node's file is the build for its own architecture.
+- Image names are platform-neutral (`ubuntu-24.04`); the catalogue holds one blob per arch under the same name.
+
+## macOS node
+- `dist/macos/prepare.sh` turns an Apple silicon Mac into a node: Remote Login, no sleep, restart after power loss, Homebrew, Tart, QEMU, and ingot plus cu under `~/.copper`.
+- ingot runs as the LaunchAgent `com.copper.ingot` in the logged-in user's session, with `KeepAlive` and logs at `~/.copper/ingot.log`. launchd has no `RestartPreventExitStatus`, so a wrapper turns exit status 78 into a clean exit that `KeepAlive` leaves alone.
+- Each running VM is its own LaunchAgent, so restarting or updating ingot never stops guests.
+- Settings live in `~/.copper/config`. `prepare.sh --update` fetches new binaries, swaps them by rename (overwriting a running signed binary in place gets it killed on Apple silicon), and restarts ingot without sudo.
+- Auto-login has to be turned on by hand in System Settings so VMs come back after a reboot.
 
 ## User API
 - Projects group instances and belong to a user. Users have a role of admin or user. Admins list all projects and address another user's project with `cu --project owner:project ...`; ordinary users can only access their own projects.
 - Auth is API tokens, stored hashed, created by the admin. `kiln token --user NAME` preserves existing roles; only an explicit `--role` changes one. New users default to role `user`.
-- Everything binds to the Tailscale address. The tailnet is the trust boundary for v1.
+- Kiln binds the Tailscale address by default. The tailnet is the trust boundary for v1.
+- `--listen` takes several addresses, so kiln can also serve the home LAN (`install.sh kiln --lan`). That is plain HTTP: user and node bearer tokens cross the LAN unencrypted, and kiln logs a warning for every listener outside loopback and the tailnet. TLS is not built.
+- `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.

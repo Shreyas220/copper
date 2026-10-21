@@ -46,9 +46,30 @@ enum Cmd {
         /// SSH public key (text or path). Repeatable. Defaults to ~/.ssh/*.pub.
         #[arg(long = "ssh-key")]
         ssh_keys: Vec<String>,
+        /// Admin: place on exactly this node, or refuse.
+        #[arg(long)]
+        node: Option<NodeId>,
+        /// Admin: spread instances of this group across nodes where possible.
+        #[arg(long)]
+        spread: Option<String>,
     },
     Start { name: String },
     Stop { name: String },
+    /// Resize a stopped instance. Disks only grow.
+    Resize {
+        name: String,
+        #[arg(long)]
+        vcpus: Option<u32>,
+        /// Memory in MB.
+        #[arg(long)]
+        memory: Option<u64>,
+        /// Boot disk size in GB.
+        #[arg(long)]
+        disk: Option<u64>,
+    },
+    /// Base images in kiln's catalogue
+    #[command(subcommand)]
+    Image(ImageCmd),
     /// Delete an instance. Final: the boot disk goes with it.
     Rm { name: String },
     /// Admin: abandon tracking on a retired node. Does not erase host disks.
@@ -69,6 +90,38 @@ enum NodeCmd {
     Ls,
     Approve { id: NodeId },
     Retire { id: NodeId },
+    /// Set overcommit ratios: placement admits capacity × ratio.
+    Set {
+        id: NodeId,
+        #[arg(long)]
+        cpu_ratio: Option<f64>,
+        #[arg(long)]
+        memory_ratio: Option<f64>,
+        #[arg(long)]
+        disk_ratio: Option<f64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageCmd {
+    Ls,
+}
+
+fn print_node(n: &Node) -> anyhow::Result<()> {
+    let arch = serde_json::to_string(&n.arch)?.trim_matches('"').to_string();
+    let status = serde_json::to_string(&n.status)?.trim_matches('"').to_string();
+    let (cap, used, oc) = (n.capacity.clone().unwrap_or(Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 }),
+        n.allocated.clone().unwrap_or(Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 }), n.overcommit);
+    let total = |v: f64, r: f64| (v * r).floor() as u64;
+    println!(
+        "{} {:<16} {:<8} {:<8} vcpu {:>3}/{:<3} mem {:>6}/{:<6} MB disk {:>4}/{:<4} GB  ratios {}/{}/{}",
+        n.id, n.hostname, arch, status,
+        used.vcpus, total(cap.vcpus as f64, oc.cpu),
+        used.memory_mb, total(cap.memory_mb as f64, oc.memory),
+        used.disk_gb, total(cap.disk_gb as f64, oc.disk),
+        oc.cpu, oc.memory, oc.disk,
+    );
+    Ok(())
 }
 
 struct Client {
@@ -176,12 +229,23 @@ async fn main() -> anyhow::Result<()> {
             let i: Instance = c.call(Method::GET, &format!("/v1/projects/{p}/instances/{name}"), None).await?;
             println!("{}", serde_json::to_string_pretty(&i)?);
         }
-        Cmd::Create { name, vcpus, memory, image, disk, arch, ssh_keys } => {
+        Cmd::Create { name, vcpus, memory, image, disk, arch, ssh_keys, node, spread } => {
             let arch: Arch = serde_json::from_value(serde_json::Value::String(arch)).context("arch must be x86_64 or aarch64")?;
             let ssh_keys = resolve_ssh_keys(ssh_keys)?;
-            let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk, ssh_keys })?;
+            let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk, ssh_keys, node, spread })?;
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances"), Some(body)).await?;
             print_instance(&i);
+        }
+        Cmd::Resize { name, vcpus, memory, disk } => {
+            let body = serde_json::to_value(ResizeInstance { vcpus, memory_mb: memory, disk_gb: disk })?;
+            let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/resize"), Some(body)).await?;
+            print_instance(&i);
+        }
+        Cmd::Image(ImageCmd::Ls) => {
+            let v: Vec<Image> = c.call(Method::GET, "/v1/images", None).await?;
+            for i in v {
+                println!("{:<24} {:<8} {}  {} MB", i.name, serde_json::to_string(&i.arch)?.trim_matches('"'), &i.sha256[..12], i.size_bytes / (1024 * 1024));
+            }
         }
         Cmd::Start { name } => {
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/start"), None).await?;
@@ -202,8 +266,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Node(NodeCmd::Ls) => {
             let v: Vec<Node> = c.call(Method::GET, "/v1/nodes", None).await?;
             for n in v {
-                println!("{} {:<16} {:<8} {}", n.id, n.hostname, serde_json::to_string(&n.arch)?.trim_matches('"'), serde_json::to_string(&n.status)?.trim_matches('"'));
+                print_node(&n)?;
             }
+        }
+        Cmd::Node(NodeCmd::Set { id, cpu_ratio, memory_ratio, disk_ratio }) => {
+            let body = serde_json::to_value(NodePolicy { cpu_ratio, memory_ratio, disk_ratio })?;
+            let n: Node = c.call(Method::POST, &format!("/v1/nodes/{id}/policy"), Some(body)).await?;
+            print_node(&n)?;
         }
         Cmd::Node(NodeCmd::Approve { id }) => {
             let n: Node = c.call(Method::POST, &format!("/v1/nodes/{id}/approve"), None).await?;

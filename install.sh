@@ -8,9 +8,11 @@
 # Options:
 #   --version vX.Y.Z   release to install (default: latest)
 #   --binaries DIR     use binaries from DIR instead of downloading (for development)
-#   --listen ADDR:PORT kiln only; default is the Tailscale IPv4 address, port 8400
+#   --listen LIST      kiln only; ADDR:PORT[,ADDR:PORT]; default the Tailscale IPv4 address, port 8400
+#   --lan              kiln only; also listen on this machine's LAN address (plain HTTP)
+#   --image-arch LIST  kiln only; arches to add Ubuntu 24.04 for (default: this machine's)
+#   --no-image         kiln only; don't add the Ubuntu 24.04 image to the catalogue
 #   --kiln URL         ingot only; default http://kiln:8400
-#   --no-image         ingot only; skip downloading the Ubuntu 24.04 base image
 #   --dry-run          print what would be done
 set -eu
 
@@ -21,17 +23,19 @@ CONF_DIR=/etc/copper
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 IMAGE_URL_ARM="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
 
-role=""; version="latest"; binaries=""; listen=""; kiln_url=""; want_image=1; dry=0
+role=""; version="latest"; binaries=""; listen=""; lan=0; image_arch=""; kiln_url=""; want_image=1; dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
     kiln|ingot) role="$1" ;;
     --version) version="$2"; shift ;;
     --binaries) binaries="$2"; shift ;;
     --listen) listen="$2"; shift ;;
+    --lan) lan=1 ;;
+    --image-arch) image_arch="$2"; shift ;;
     --kiln) kiln_url="$2"; shift ;;
     --no-image) want_image=0 ;;
     --dry-run) dry=1 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -102,6 +106,15 @@ case "$role" in
       ts=$(tailscale ip -4 2>/dev/null || true)
       [ -n "$ts" ] && listen="$ts:8400" || listen="0.0.0.0:8400"
     fi
+    if [ "$lan" = 1 ]; then
+      lan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+      [ -n "$lan_ip" ] || die "could not find the LAN address; pass --listen explicitly"
+      case ",$listen," in
+        *,0.0.0.0:8400,*|*,"$lan_ip:8400",*) ;;
+        *) listen="$listen,$lan_ip:8400" ;;
+      esac
+      say "warning: kiln also serves plain HTTP on the LAN ($lan_ip); tokens cross it unencrypted"
+    fi
     say "kiln will listen on $listen"
     if [ "$dry" = 0 ]; then
       printf 'KILN_LISTEN=%s\n' "$listen" > "$CONF_DIR/kiln.env"
@@ -110,6 +123,28 @@ case "$role" in
     else
       echo "+ write $CONF_DIR/kiln.env (KILN_LISTEN=$listen)"; echo "+ install /etc/systemd/system/kiln.service"
     fi
+    # Nodes fetch base images from kiln by hash, so the catalogue is the only
+    # place an image has to be downloaded to.
+    if [ "$want_image" = 1 ]; then
+      kiln_as_copper() { runuser -u copper -- "$BIN_DIR/kiln" --db "$STATE_DIR/kiln.db" "$@"; }
+      for a in $(echo "${image_arch:-$arch}" | tr ',' ' '); do
+        case "$a" in
+          x86_64) url="$IMAGE_URL" ;;
+          aarch64) url="$IMAGE_URL_ARM" ;;
+          *) die "unknown image arch $a" ;;
+        esac
+        if [ "$dry" = 0 ] && kiln_as_copper image ls | grep -q "^ubuntu-24.04 *$a "; then
+          say "ubuntu-24.04 ($a) is already in the catalogue"
+          continue
+        fi
+        say "adding Ubuntu 24.04 ($a) to the image catalogue (~600 MB)"
+        part="$STATE_DIR/.ubuntu-24.04-$a.part"
+        run curl -fL --progress-bar "$url" -o "$part"
+        run chown copper:copper "$part"
+        if [ "$dry" = 0 ]; then kiln_as_copper image import --name ubuntu-24.04 --arch "$a" "$part"; else echo "+ kiln image import --name ubuntu-24.04 --arch $a $part"; fi
+        run rm -f "$part"
+      done
+    fi
     ;;
   ingot)
     for need in qemu-img cloud-localds; do
@@ -117,20 +152,8 @@ case "$role" in
     done
     getent group libvirt >/dev/null || die "libvirt group missing; apt install libvirt-daemon-system"
     [ -n "$kiln_url" ] || kiln_url="http://kiln:8400"
-    say "ingot will talk to $kiln_url"
+    say "ingot will talk to $kiln_url; base images come from kiln's catalogue"
     run install -d -o copper -g copper -m 755 "$STATE_DIR/images" "$STATE_DIR/disks"
-    if [ "$want_image" = 1 ]; then
-      img="$STATE_DIR/images/ubuntu-24.04.img"
-      if [ -f "$img" ]; then
-        say "base image already present"
-      else
-        [ "$arch" = aarch64 ] && IMAGE_URL="$IMAGE_URL_ARM"
-        say "downloading Ubuntu 24.04 base image (~600 MB)"
-        run curl -fL --progress-bar "$IMAGE_URL" -o "$img.part"
-        run mv "$img.part" "$img"
-        run chown copper:copper "$img"
-      fi
-    fi
     if [ "$dry" = 0 ]; then
       printf 'INGOT_KILN=%s\n' "$kiln_url" > "$CONF_DIR/ingot.env"
       fetch_unit ingot.service
@@ -157,8 +180,13 @@ kiln is running on $listen. Create your admin token:
 
 Then from any machine on the tailnet:
 
-  export CU_URL=http://$listen  CU_TOKEN=<token>
+  export CU_URL=http://${listen%%,*}  CU_TOKEN=<token>
   cu project create default
+
+Add more base images, e.g. arm64 for a Mac node:
+
+  sudo sh install.sh kiln --image-arch aarch64
+  sudo -u copper kiln --db $STATE_DIR/kiln.db image import --name NAME --arch ARCH FILE.qcow2
 MSG
     ;;
   ingot)

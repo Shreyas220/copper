@@ -2,7 +2,7 @@
 //!
 //! Two protocols live here:
 //! - `node`: controller <-> agent (desired state pull, observed state push)
-//! - `user`: what `hc` and any future UI talk to
+//! - `user`: what `cu` and any future UI talk to
 
 pub mod node;
 pub mod user;

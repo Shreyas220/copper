@@ -28,13 +28,45 @@ impl Disks {
         Ok(image)
     }
 
+    /// Where images fetched from kiln by hash live. A subdirectory, so a
+    /// hash can never collide with a node-local `<name>.img`.
+    pub fn hashed_dir(&self) -> PathBuf {
+        self.images.join("sha256")
+    }
+
+    /// The base image a boot disk starts from: the catalogue blob when kiln
+    /// bound one, else the node-local image by name.
+    pub fn base_image(&self, disk: &BootDisk) -> anyhow::Result<PathBuf> {
+        let Some(hash) = &disk.sha256 else { return self.image_path(&disk.image) };
+        if !valid_sha256(hash) { bail!("invalid image hash") }
+        let path = self.hashed_dir().join(format!("{hash}.img"));
+        if !path.is_file() { bail!("image {} ({}) is not downloaded yet", disk.image, &hash[..12]) }
+        Ok(path)
+    }
+
+    /// Grow the overlay's virtual size to `size_gb`. Never shrinks. The VM
+    /// must be off; qemu's image lock makes this fail safely otherwise.
+    pub fn grow(&self, id: InstanceId, size_gb: u64) -> anyhow::Result<()> {
+        let path = self.disk_path(id);
+        let out = Command::new("qemu-img").args(["info", "--output=json", "-f", "qcow2"]).arg(&path).output().context("running qemu-img info")?;
+        if !out.status.success() { bail!("qemu-img info failed: {}", String::from_utf8_lossy(&out.stderr).trim()) }
+        let info: serde_json::Value = serde_json::from_slice(&out.stdout).context("parsing qemu-img info")?;
+        let current = info["virtual-size"].as_u64().context("qemu-img info has no virtual-size")?;
+        if current >= size_gb * (1 << 30) {
+            return Ok(());
+        }
+        run(Command::new("qemu-img").args(["resize", "-q", "-f", "qcow2"]).arg(&path).arg(format!("{size_gb}G")))?;
+        tracing::info!(instance = %id, size_gb, "boot disk grown");
+        Ok(())
+    }
+
     /// Create the overlay if it does not exist. Idempotent.
     pub fn ensure_disk(&self, id: InstanceId, spec: &InstanceSpec) -> anyhow::Result<PathBuf> {
         let path = self.disk_path(id);
         if path.exists() {
             return Ok(path);
         }
-        let base = self.image_path(&spec.boot_disk.image)?;
+        let base = self.base_image(&spec.boot_disk)?;
         std::fs::create_dir_all(&self.dir)?;
         // Write to a temp name and rename, so a crash never leaves a half-made
         // disk that looks real.
@@ -100,7 +132,10 @@ impl Disks {
                 Err(_) => return 0,
             }
         }
-        (st.f_bavail.saturating_mul(st.f_frsize).saturating_add(allocated)) / (1024 * 1024 * 1024)
+        // statvfs field widths differ between Linux and macOS.
+        #[allow(clippy::unnecessary_cast)]
+        let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+        free.saturating_add(allocated) / (1024 * 1024 * 1024)
     }
 }
 
@@ -147,9 +182,24 @@ mod tests {
         assert!(disks.image_path("ubuntu-24.04").is_ok());
     }
     #[test]
+    fn hashed_images_resolve_inside_their_own_directory() {
+        let dir = TempDir::new();
+        let disks = Disks { dir: dir.path().into(), images: dir.path().join("images") };
+        let hash = "ab".repeat(32);
+        let disk = |sha256: Option<String>| BootDisk { image: "ubuntu-24.04".into(), sha256, size_gb: 10 };
+        assert!(disks.base_image(&disk(Some(hash.clone()))).unwrap_err().to_string().contains("not downloaded"));
+        assert!(disks.base_image(&disk(Some("../../etc/passwd".into()))).is_err());
+        std::fs::create_dir_all(disks.hashed_dir()).unwrap();
+        std::fs::write(disks.hashed_dir().join(format!("{hash}.img")), "blob").unwrap();
+        assert_eq!(disks.base_image(&disk(Some(hash.clone()))).unwrap(), disks.hashed_dir().join(format!("{hash}.img")));
+        // Without a hash the node-local image by name is used, as before.
+        std::fs::write(disks.images.join("ubuntu-24.04.img"), "local").unwrap();
+        assert!(disks.base_image(&disk(None)).unwrap().ends_with("ubuntu-24.04.img"));
+    }
+    #[test]
     fn cloud_init_values_are_quoted_without_newline_injection() {
         let spec = InstanceSpec { vcpus: 1, memory_mb: 1024, arch: Arch::X86_64,
-            boot_disk: BootDisk { image: "ubuntu".into(), size_gb: 10 }, nics: vec![],
+            boot_disk: BootDisk { image: "ubuntu".into(), sha256: None, size_gb: 10 }, nics: vec![],
             ssh_keys: vec!["ssh-ed25519 key\nruncmd:\n  - malicious".into()] };
         let data = user_data_yaml("vm\nusers: []", &spec);
         assert!(!data.contains("\nusers:"));

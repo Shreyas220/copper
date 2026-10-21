@@ -191,6 +191,7 @@ impl hv::Hypervisor for EmptyHypervisor {
     fn shutdown(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
     fn destroy(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
     fn undefine(&self, _: InstanceId) -> anyhow::Result<()> { unreachable!() }
+    fn reconfigure(&self, _: &DesiredInstance) -> anyhow::Result<()> { unreachable!() }
     fn addresses(&self, _: InstanceId) -> Vec<String> { unreachable!() }
 }
 

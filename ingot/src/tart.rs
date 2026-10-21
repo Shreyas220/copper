@@ -169,7 +169,7 @@ impl Hypervisor for Tart {
         let name = name_of(inst.id);
         let dir = self.vm_dir(inst.id);
         if !dir.join("disk.img").exists() {
-            let base = self.disks.image_path(&inst.spec.boot_disk.image)?;
+            let base = self.disks.base_image(&inst.spec.boot_disk)?;
             // Create the VM shell, then replace its empty raw disk with the
             // cloud image converted to raw and grown to the requested size.
             run(Command::new("tart").args(["create", &name, "--linux", "--disk-size", &inst.spec.boot_disk.size_gb.to_string()]))?;
@@ -180,8 +180,23 @@ impl Hypervisor for Tart {
             crate::state::publish_file(&tmp, &disk)?;
             tracing::info!(instance = %inst.id, disk = %disk.display(), "boot disk created");
         }
-        run(Command::new("tart").args(["set", &name, "--cpu", &inst.spec.vcpus.to_string(), "--memory", &inst.spec.memory_mb.to_string()]))?;
+        // vCPUs and memory are applied by `reconfigure` before every start.
         self.ensure_seed(inst)?;
+        Ok(())
+    }
+
+    fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()> {
+        if self.state(inst.id)? == Some(DomState::Running) {
+            bail!("vm is running; resize applies after it stops");
+        }
+        let name = name_of(inst.id);
+        run(Command::new("tart").args(["set", &name, "--cpu", &inst.spec.vcpus.to_string(), "--memory", &inst.spec.memory_mb.to_string()]))?;
+        let disk = self.vm_dir(inst.id).join("disk.img");
+        let want = inst.spec.boot_disk.size_gb * (1 << 30);
+        if std::fs::metadata(&disk).with_context(|| format!("reading {}", disk.display()))?.len() < want {
+            run(Command::new("qemu-img").args(["resize", "-q", "-f", "raw"]).arg(&disk).arg(format!("{}G", inst.spec.boot_disk.size_gb)))?;
+            tracing::info!(instance = %inst.id, size_gb = inst.spec.boot_disk.size_gb, "boot disk grown");
+        }
         Ok(())
     }
 

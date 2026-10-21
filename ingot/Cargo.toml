@@ -20,6 +20,7 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 libc = "0.2"
+sha2 = "0.10"
 
 # libvirt is the Linux backend. macOS uses Tart (see src/tart.rs) and must not
 # link libvirt, which Homebrew does not ship with a usable KVM-like driver.

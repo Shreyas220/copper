@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::node::{Arch, DesiredState, InstanceId, NodeId, ObservedState};
+use crate::node::{Arch, Capacity, DesiredState, InstanceId, NodeId, ObservedState};
 
 /// Instance state as the user sees it. Derived from (desired, observed, node online),
 /// never stored. See docs/design.md for the table.
@@ -57,6 +57,9 @@ pub struct Instance {
     /// Admin only. Stripped for ordinary users.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
+    /// Admin only: the spread group this instance was placed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +73,25 @@ pub struct CreateInstance {
     /// SSH public keys for the default user.
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Admin only: place on exactly this node, or refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeId>,
+    /// Admin only: prefer nodes holding the fewest instances of this group
+    /// in the same project. Soft: never refuses on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<String>,
+}
+
+/// Change a stopped instance's size. Omitted fields stay as they are. Disks
+/// only grow.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResizeInstance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,12 +103,62 @@ pub enum NodeStatus {
     Retired,
 }
 
+/// Per-node overcommit ratios, set by the admin. Placement admits up to
+/// `reported capacity × ratio` of each resource.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Overcommit {
+    pub cpu: f64,
+    pub memory: f64,
+    pub disk: f64,
+}
+
+impl Default for Overcommit {
+    fn default() -> Self {
+        Self { cpu: 1.0, memory: 1.0, disk: 1.0 }
+    }
+}
+
+impl Overcommit {
+    pub const MAX: f64 = 64.0;
+    pub fn valid(&self) -> bool {
+        [self.cpu, self.memory, self.disk].iter().all(|r| r.is_finite() && *r > 0.0 && *r <= Self::MAX)
+    }
+}
+
+/// Partial update of a node's overcommit ratios.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_ratio: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub hostname: String,
     pub arch: Arch,
     pub status: NodeStatus,
+    /// What the node reported: host resources minus its reserve.
+    #[serde(default)]
+    pub capacity: Option<Capacity>,
+    /// Sum of every instance assigned to the node, including pending deletions.
+    #[serde(default)]
+    pub allocated: Option<Capacity>,
+    #[serde(default)]
+    pub overcommit: Overcommit,
+}
+
+/// A base image in kiln's catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Image {
+    pub name: String,
+    pub arch: Arch,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,6 +8,9 @@ use copper_api::*;
 #[derive(Clone)]
 pub struct Kiln {
     http: reqwest::Client,
+    /// Image downloads take minutes, so they get a stall timeout instead of
+    /// a total one.
+    download: reqwest::Client,
     base: String,
     node_id: NodeId,
     token: String,
@@ -20,7 +23,50 @@ impl Kiln {
             .timeout(Duration::from_secs(40))
             .build()
             .unwrap();
-        Self { http, base: base.trim_end_matches('/').to_string(), node_id, token }
+        let download = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        Self { http, download, base: base.trim_end_matches('/').to_string(), node_id, token }
+    }
+
+    /// Download a catalogue blob to `dest`, verifying its SHA-256 on the way.
+    /// Nothing appears at `dest` unless the hash matched.
+    pub async fn fetch_image(&self, hash: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        anyhow::ensure!(valid_sha256(hash), "invalid image hash");
+        let dir = dest.parent().context("image path needs a directory")?;
+        tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+        let mut resp = self.download
+            .get(format!("{}/nodes/{}/images/{hash}", self.base, self.node_id))
+            .bearer_auth(&self.token)
+            .send()
+            .await?
+            .error_for_status()?;
+        let tmp = dest.with_extension("part");
+        let mut file = tokio::fs::File::create(&tmp).await.with_context(|| format!("creating {}", tmp.display()))?;
+        let mut hasher = Sha256::new();
+        let copied = async {
+            while let Some(chunk) = resp.chunk().await? {
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            file.sync_all().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        drop(file);
+        let verified = copied.and_then(|()| {
+            let got = format!("{:x}", hasher.finalize());
+            if got == hash { Ok(()) } else { Err(anyhow::anyhow!("download did not match its hash (got {got})")) }
+        });
+        if let Err(e) = verified {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        crate::state::publish_file(&tmp, dest)
     }
 
     pub async fn register(&self, req: &RegisterRequest) -> anyhow::Result<RegistrationStatus> {

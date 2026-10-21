@@ -7,11 +7,13 @@
 //! desired-absent is irreversible and cleanup must eventually complete.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use copper_api::*;
 
 use crate::hv::{DomState, Hypervisor};
+use crate::images::Images;
 
 const FAIL_BUDGET: Duration = Duration::from_secs(5 * 60);
 const RETRY_EVERY: Duration = Duration::from_secs(10);
@@ -40,6 +42,13 @@ pub struct Reconciler<H = crate::hv::Native> {
     stop_requested: HashMap<InstanceId, Instant>,
     /// Snapshot whose generation is paired with observations under the same lock.
     desired: DesiredNodeState,
+    /// Images fetched from kiln. `None` means hashed images must already be present.
+    images: Option<Arc<Images>>,
+    /// Instances waiting for their base image, with the note to report.
+    waiting: HashMap<InstanceId, String>,
+    /// Size last applied to each VM by this process, so `reconfigure` runs
+    /// once per change instead of on every tick.
+    configured: HashMap<InstanceId, (u32, u64, u64)>,
 }
 
 impl<H: Hypervisor> Reconciler<H> {
@@ -50,7 +59,26 @@ impl<H: Hypervisor> Reconciler<H> {
             failures: HashMap::new(),
             stop_requested: HashMap::new(),
             desired: DesiredNodeState { generation: 0, instances: vec![] },
+            images: None,
+            waiting: HashMap::new(),
+            configured: HashMap::new(),
         }
+    }
+
+    pub fn with_images(mut self, images: Arc<Images>) -> Self {
+        self.images = Some(images);
+        self
+    }
+
+    /// A running instance whose catalogue image isn't here yet waits for the
+    /// download instead of failing; waiting never consumes the failure budget.
+    fn waiting_for_image(&self, inst: &DesiredInstance) -> Option<String> {
+        let images = self.images.as_ref()?;
+        let hash = inst.spec.boot_disk.sha256.as_deref()?;
+        if inst.state != DesiredState::Running || !valid_sha256(hash) || images.ready(hash) {
+            return None;
+        }
+        Some(images.want(&inst.spec.boot_disk.image, hash))
     }
 
     pub fn capacity(&self) -> Capacity {
@@ -74,6 +102,15 @@ impl<H: Hypervisor> Reconciler<H> {
             if self.failures.get(&inst.id).is_some_and(|f| f.desired != inst.state) {
                 self.failures.remove(&inst.id);
             }
+            match self.waiting_for_image(inst) {
+                Some(note) => {
+                    self.waiting.insert(inst.id, note);
+                    continue;
+                }
+                None => {
+                    self.waiting.remove(&inst.id);
+                }
+            }
             if let Some(f) = self.failures.get(&inst.id) {
                 if (inst.state != DesiredState::Absent && f.exhausted()) || f.last_try.elapsed() < RETRY_EVERY {
                     continue;
@@ -81,7 +118,7 @@ impl<H: Hypervisor> Reconciler<H> {
             }
             let result = match inst.state {
                 DesiredState::Running => self.ensure_running(inst),
-                DesiredState::Stopped => self.ensure_stopped(inst.id),
+                DesiredState::Stopped => self.ensure_stopped(inst),
                 DesiredState::Absent => self.ensure_absent(inst.id),
             };
             match result {
@@ -108,21 +145,42 @@ impl<H: Hypervisor> Reconciler<H> {
         let known: std::collections::HashSet<_> = desired.instances.iter().map(|i| i.id).collect();
         self.failures.retain(|id, _| known.contains(id));
         self.stop_requested.retain(|id, _| known.contains(id));
-
+        self.waiting.retain(|id, _| known.contains(id));
+        self.configured.retain(|id, _| known.contains(id));
     }
 
     fn ensure_running(&mut self, inst: &DesiredInstance) -> anyhow::Result<()> {
         self.stop_requested.remove(&inst.id);
         self.hv.prepare(inst)?;
         self.hv.define(inst)?;
+        if self.hv.state(inst.id)? == Some(DomState::Off) {
+            self.reconfigure(inst)?;
+        }
         self.hv.start(inst.id)
     }
 
-    fn ensure_stopped(&mut self, id: InstanceId) -> anyhow::Result<()> {
+    /// Apply a resize to a VM that is off. Idempotent in the backend; cached
+    /// here so an unchanged spec costs nothing per tick.
+    fn reconfigure(&mut self, inst: &DesiredInstance) -> anyhow::Result<()> {
+        let size = (inst.spec.vcpus, inst.spec.memory_mb, inst.spec.boot_disk.size_gb);
+        if self.configured.get(&inst.id) == Some(&size) {
+            return Ok(());
+        }
+        self.hv.reconfigure(inst)?;
+        self.configured.insert(inst.id, size);
+        Ok(())
+    }
+
+    fn ensure_stopped(&mut self, inst: &DesiredInstance) -> anyhow::Result<()> {
+        let id = inst.id;
         match self.hv.state(id)? {
-            None | Some(DomState::Off) => {
+            None => {
                 self.stop_requested.remove(&id);
                 Ok(())
+            }
+            Some(DomState::Off) => {
+                self.stop_requested.remove(&id);
+                self.reconfigure(inst)
             }
             Some(_) => {
                 let since = *self.stop_requested.entry(id).or_insert_with(Instant::now);
@@ -158,6 +216,7 @@ impl<H: Hypervisor> Reconciler<H> {
                 // Never acknowledge deletion while disk cleanup is failing, even
                 // when the domain and boot disk have already been removed.
                 (Ok(None), Some(f)) if inst.state == DesiredState::Absent => (ObservedState::Stopping, Some(f.error.clone())),
+                (Ok(None), _) if self.waiting.contains_key(&id) => (ObservedState::Starting, self.waiting.get(&id).cloned()),
                 (Ok(None), _) if self.hv.has_storage(id) => (ObservedState::Stopped, None),
                 (Ok(None), _) => (ObservedState::Absent, None),
             };
@@ -213,6 +272,11 @@ mod tests {
             *self.state.borrow_mut() = None;
             Ok(())
         }
+        fn reconfigure(&self, _: &DesiredInstance) -> anyhow::Result<()> {
+            assert_ne!(*self.state.borrow(), Some(DomState::Running), "reconfigured a running VM");
+            self.calls.borrow_mut().push("reconfigure");
+            Ok(())
+        }
         fn addresses(&self, _: InstanceId) -> Vec<String> { vec![] }
     }
     fn snapshot(state: DesiredState) -> DesiredNodeState {
@@ -220,10 +284,58 @@ mod tests {
             id: InstanceId::new_v4(), name: "vm".into(), state,
             spec: InstanceSpec {
                 vcpus: 1, memory_mb: 1024, arch: Arch::X86_64,
-                boot_disk: BootDisk { image: "ubuntu".into(), size_gb: 10 },
+                boot_disk: BootDisk { image: "ubuntu".into(), sha256: None, size_gb: 10 },
                 nics: vec![], ssh_keys: vec![],
             },
         }] }
+    }
+    #[test]
+    fn running_instance_waits_for_its_image_without_spending_the_failure_budget() {
+        let dir = TempDir::new();
+        let (images, mut queue) = Images::new(dir.path().join("sha256"));
+        let images = Arc::new(images);
+        let mut r = reconciler(&dir, Fake::default()).with_images(images.clone());
+        let mut d = snapshot(DesiredState::Running);
+        let hash = "cd".repeat(32);
+        d.instances[0].spec.boot_disk.sha256 = Some(hash.clone());
+        for _ in 0..3 { r.reconcile(&d); }
+        let report = r.observe();
+        assert_eq!(report.instances[0].state, ObservedState::Starting);
+        assert_eq!(report.instances[0].error.as_deref(), Some("fetching image ubuntu"));
+        assert!(r.failures.is_empty());
+        assert!(r.hv.calls.borrow().is_empty());
+        // Only one download is queued while it is in flight.
+        assert_eq!(queue.try_recv().unwrap(), hash);
+        assert!(queue.try_recv().is_err());
+        std::fs::create_dir_all(dir.path().join("sha256")).unwrap();
+        std::fs::write(images.path(&hash), "verified blob").unwrap();
+        r.reconcile(&d);
+        assert_eq!(*r.hv.calls.borrow(), vec!["start"]);
+        assert_eq!(r.observe().instances[0].state, ObservedState::Running);
+    }
+    #[test]
+    fn resize_is_applied_once_per_change_and_only_while_off() {
+        let dir = TempDir::new();
+        let mut r = reconciler(&dir, Fake { state: RefCell::new(Some(DomState::Off)), ..Fake::default() });
+        let reconfigures = |r: &Reconciler<Fake>| r.hv.calls.borrow().iter().filter(|c| **c == "reconfigure").count();
+        let mut d = snapshot(DesiredState::Stopped);
+        r.reconcile(&d);
+        r.reconcile(&d);
+        assert_eq!(reconfigures(&r), 1);
+        d.instances[0].spec.memory_mb = 2048;
+        d.generation += 1;
+        r.reconcile(&d);
+        assert_eq!(reconfigures(&r), 2);
+        // Starting applies a pending change first; a running VM is left alone.
+        d.instances[0].spec.vcpus = 2;
+        d.instances[0].state = DesiredState::Running;
+        r.reconcile(&d);
+        r.reconcile(&d);
+        assert_eq!(reconfigures(&r), 3);
+        assert_eq!(r.hv.calls.borrow()[2..4], ["reconfigure", "start"]);
+        d.instances[0].spec.vcpus = 4;
+        r.reconcile(&d);
+        assert_eq!(reconfigures(&r), 3);
     }
     fn reconciler(dir: &TempDir, mut hv: Fake) -> Reconciler<Fake> {
         hv.disks = crate::disk::Disks { dir: dir.path().to_owned(), images: dir.path().to_owned() };

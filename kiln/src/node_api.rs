@@ -25,6 +25,49 @@ pub fn router() -> Router<AppState> {
         .route("/nodes/register", post(register))
         .route("/nodes/{id}/desired", get(desired))
         .route("/nodes/{id}/observed", post(observed))
+        .route("/nodes/{id}/images/{sha256}", get(image))
+}
+
+/// Stream a catalogue blob to an approved node. Nodes verify the hash
+/// themselves; kiln only serves blobs something still refers to.
+async fn image(
+    State(state): State<AppState>,
+    Path((id, sha256)): Path<(NodeId, String)>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
+    use tokio::io::AsyncReadExt;
+    {
+        let conn = state.db.lock().unwrap();
+        authenticate(&conn, id, &headers)?;
+        if !valid_sha256(&sha256) || !db::blob_referenced(&conn, &sha256)? {
+            return Err(Error::not_found("image"));
+        }
+    }
+    let path = state.catalog.join(format!("{sha256}.img"));
+    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+        tracing::error!(file = %path.display(), error = %e, "catalogue blob missing");
+        Error::not_found("image")
+    })?;
+    let len = file.metadata().await.map_err(|e| Error::from(anyhow::Error::from(e)))?.len();
+    // One read per chunk; an error ends the stream so the node sees a short body.
+    let body = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut buf = vec![0u8; 1 << 20];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(axum::body::Bytes::from(buf)), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    tracing::info!(node = %id, image = %sha256, bytes = len, "serving image");
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(axum::http::header::CONTENT_LENGTH, len)
+        .body(axum::body::Body::from_stream(body))
+        .map_err(|e| Error::from(anyhow::Error::from(e)))?)
 }
 
 async fn register(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<RegisterRequest>) -> Result<Json<RegisterResponse>> {

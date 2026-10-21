@@ -60,9 +60,19 @@ pub enum DesiredState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootDisk {
-    /// Content hash of the base image; the agent fetches it from the controller if missing.
+    /// Platform-neutral image name, e.g. `ubuntu-24.04`.
     pub image: String,
+    /// SHA-256 of the base image in kiln's catalogue for this arch. The agent
+    /// fetches it from kiln by hash if missing. `None` means the node must
+    /// have `<image>.img` locally, as before the catalogue existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub size_gb: u64,
+}
+
+/// Lowercase hex SHA-256, as kiln names catalogue blobs.
+pub fn valid_sha256(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

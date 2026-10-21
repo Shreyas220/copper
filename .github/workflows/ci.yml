@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libvirt-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --workspace
+      - run: cargo check --locked -p ingot --features tart
+      - run: sh -n install.sh && sh -n dist/macos/prepare.sh
+
+  # The Tart backend only compiles for real here. GitHub's Apple silicon
+  # runners can't nest virtualization, so it still isn't run against Tart.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --workspace

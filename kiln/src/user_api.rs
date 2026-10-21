@@ -20,10 +20,13 @@ pub fn router() -> Router<AppState> {
         .route("/v1/projects/{project}/instances/{name}", get(get_instance).delete(delete_instance))
         .route("/v1/projects/{project}/instances/{name}/start", post(start_instance))
         .route("/v1/projects/{project}/instances/{name}/stop", post(stop_instance))
+        .route("/v1/projects/{project}/instances/{name}/resize", post(resize_instance))
         .route("/v1/instances/{id}/forget", post(forget_instance))
+        .route("/v1/images", get(list_images))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/{id}/approve", post(approve_node))
         .route("/v1/nodes/{id}/retire", post(retire_node))
+        .route("/v1/nodes/{id}/policy", post(set_node_policy))
 }
 
 #[derive(serde::Serialize)]
@@ -99,6 +102,7 @@ fn to_api(conn: &rusqlite::Connection, row: InstanceRow, project: &str, admin: b
         addresses: observed.map(|o| o.addresses.clone()).unwrap_or_default(),
         error: observed.and_then(|o| o.error.clone()),
         node: admin.then_some(row.node_id),
+        spread: if admin { row.spread } else { None },
     })
 }
 
@@ -126,23 +130,36 @@ async fn create_instance(
     if !valid_image_name(&req.image) {
         return Err(Error::bad_request("image must be a filename stem using lowercase letters, digits, '.', '_' or '-', starting with a letter or digit"));
     }
+    let admin = auth.0.role == Role::Admin;
+    if (req.node.is_some() || req.spread.is_some()) && !admin {
+        return Err(Error(StatusCode::FORBIDDEN, "placement hints are admin-only".into()));
+    }
+    if let Some(group) = &req.spread { validate_name(group)?; }
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
     if db::instance_by_name(&conn, p.id, &req.name)?.is_some() {
         return Err(Error::conflict("instance already exists"));
     }
+    if let Some(node) = req.node {
+        db::node(&conn, node)?.ok_or_else(|| Error::not_found("node"))?;
+    }
+    // The catalogue binds the name to a blob now, so the instance keeps that
+    // exact image even if the name is re-imported later. Without an entry the
+    // node must hold `<image>.img` itself.
+    let sha256 = db::image(&conn, &req.image, req.arch)?.map(|i| i.sha256);
     let spec = InstanceSpec {
         vcpus: req.vcpus,
         memory_mb: req.memory_mb,
         arch: req.arch,
-        boot_disk: BootDisk { image: req.image.clone(), size_gb: req.disk_gb },
+        boot_disk: BootDisk { image: req.image.clone(), sha256, size_gb: req.disk_gb },
         nics: vec![Nic { bridge: state.bridge.clone(), mac: random_mac() }],
         ssh_keys: req.ssh_keys.clone(),
     };
     // Placement and insert are one transaction so two creates can't both land
     // on the last slot of a node.
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-    let node = placement::choose(&tx, &spec)?;
+    let hints = placement::Hints { node: req.node, spread: req.spread.as_deref().map(|g| (p.id, g)) };
+    let node = placement::choose(&tx, &spec, &hints)?;
     let row = InstanceRow {
         id: InstanceId::new_v4(),
         project_id: p.id,
@@ -151,14 +168,62 @@ async fn create_instance(
         desired: DesiredState::Running,
         spec,
         observed: None,
+        spread: req.spread,
     };
     db::insert_instance(&tx, &row)?;
     db::bump_generation(&tx, node.id)?;
     tx.commit()?;
     state.notify_changed();
     tracing::info!(instance = %row.id, name = %row.name, node = %row.node_id, "instance created");
-    let admin = auth.0.role == Role::Admin;
     Ok((StatusCode::CREATED, Json(to_api(&conn, row, &project, admin)?)))
+}
+
+/// Resize a stopped instance in place. It never moves: the new size must fit
+/// on its node once its current allocation is released, or the request is
+/// refused. Disks only grow; the guest grows its filesystem on next boot.
+async fn resize_instance(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path((project, name)): Path<(String, String)>,
+    Json(req): Json<ResizeInstance>,
+) -> Result<Json<Instance>> {
+    let conn = state.db.lock().unwrap();
+    let row = load(&conn, &auth, &project, &name)?;
+    let admin = auth.0.role == Role::Admin;
+    let node = db::node(&conn, row.node_id)?.ok_or_else(|| Error::not_found("node"))?;
+    let current = InstanceState::derive(row.desired, row.observed.as_ref().map(|o| o.state), node.online());
+    if row.desired != DesiredState::Stopped || current != InstanceState::Stopped {
+        return Err(Error::conflict("stop the instance and wait until it is stopped before resizing"));
+    }
+    let mut spec = row.spec.clone();
+    spec.vcpus = req.vcpus.unwrap_or(spec.vcpus);
+    spec.memory_mb = req.memory_mb.unwrap_or(spec.memory_mb);
+    let disk_gb = req.disk_gb.unwrap_or(spec.boot_disk.size_gb);
+    if spec.vcpus == 0 || spec.memory_mb < 128 {
+        return Err(Error::bad_request("vcpus must be positive and memory at least 128 MB"));
+    }
+    if disk_gb < spec.boot_disk.size_gb {
+        return Err(Error::bad_request("disks only grow; shrinking would destroy data"));
+    }
+    spec.boot_disk.size_gb = disk_gb;
+    if spec != row.spec {
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        if !placement::fits_in_place(&tx, &node, row.id, &spec)? {
+            return Err(Error::conflict("the instance's node lacks capacity for the new size"));
+        }
+        db::set_spec(&tx, row.id, &spec)?;
+        db::bump_generation(&tx, row.node_id)?;
+        tx.commit()?;
+        state.notify_changed();
+        tracing::info!(instance = %row.id, vcpus = spec.vcpus, memory_mb = spec.memory_mb, disk_gb, "instance resized");
+    }
+    let row = db::instance(&conn, row.id)?.ok_or_else(|| Error::not_found("instance"))?;
+    Ok(Json(to_api(&conn, row, &project, admin)?))
+}
+
+async fn list_images(State(state): State<AppState>, _auth: Auth) -> Result<Json<Vec<Image>>> {
+    let conn = state.db.lock().unwrap();
+    Ok(Json(db::list_images(&conn)?))
 }
 
 fn load(conn: &rusqlite::Connection, auth: &Auth, project: &str, name: &str) -> Result<InstanceRow> {
@@ -220,10 +285,34 @@ async fn delete_instance(State(state): State<AppState>, auth: Auth, Path((projec
 
 // ---- nodes (admin) ---------------------------------------------------------
 
+fn node_api(conn: &rusqlite::Connection, node: &db::NodeRow) -> Result<Node> {
+    let instances = db::list_instances_on_node(conn, node.id)?;
+    Ok(node.to_api(placement::allocated(instances.iter())))
+}
+
 async fn list_nodes(State(state): State<AppState>, auth: Auth) -> Result<Json<Vec<Node>>> {
     auth.require_admin()?;
     let conn = state.db.lock().unwrap();
-    Ok(Json(db::list_nodes(&conn)?.iter().map(|n| n.to_api()).collect()))
+    db::list_nodes(&conn)?.iter().map(|n| node_api(&conn, n)).collect::<Result<Vec<_>>>().map(Json)
+}
+
+/// Overcommit is admin policy, per node. Lowering a ratio below what is
+/// already allocated is allowed: nothing is evicted, new placements stop.
+async fn set_node_policy(State(state): State<AppState>, auth: Auth, Path(id): Path<NodeId>, Json(req): Json<NodePolicy>) -> Result<Json<Node>> {
+    auth.require_admin()?;
+    let conn = state.db.lock().unwrap();
+    let node = db::node(&conn, id)?.ok_or_else(|| Error::not_found("node"))?;
+    let oc = Overcommit {
+        cpu: req.cpu_ratio.unwrap_or(node.overcommit.cpu),
+        memory: req.memory_ratio.unwrap_or(node.overcommit.memory),
+        disk: req.disk_ratio.unwrap_or(node.overcommit.disk),
+    };
+    if !oc.valid() {
+        return Err(Error::bad_request(format!("ratios must be greater than 0 and at most {}", Overcommit::MAX)));
+    }
+    db::set_overcommit(&conn, id, &oc)?;
+    tracing::info!(node = %id, cpu = oc.cpu, memory = oc.memory, disk = oc.disk, "overcommit changed");
+    node_api(&conn, &db::node(&conn, id)?.unwrap()).map(Json)
 }
 
 async fn approve_node(State(state): State<AppState>, auth: Auth, Path(id): Path<NodeId>) -> Result<Json<Node>> {
@@ -237,7 +326,7 @@ async fn approve_node(State(state): State<AppState>, auth: Auth, Path(id): Path<
     db::set_node_status(&conn, id, NodeDbStatus::Approved)?;
     state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node approved");
-    Ok(Json(db::node(&conn, id)?.unwrap().to_api()))
+    node_api(&conn, &db::node(&conn, id)?.unwrap()).map(Json)
 }
 
 /// Retiring a node marks every instance on it failed. Nothing is re-created.
@@ -251,7 +340,7 @@ async fn retire_node(State(state): State<AppState>, auth: Auth, Path(id): Path<N
     tx.commit()?;
     state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node retired");
-    Ok(Json(db::node(&conn, id)?.unwrap().to_api()))
+    node_api(&conn, &db::node(&conn, id)?.unwrap()).map(Json)
 }
 
 // ---- helpers ---------------------------------------------------------------

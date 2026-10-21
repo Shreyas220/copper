@@ -5,6 +5,7 @@ mod client;
 mod disk;
 mod hv;
 mod identity;
+mod images;
 #[cfg(not(target_os = "macos"))]
 mod libvirt;
 mod reconcile;
@@ -103,15 +104,20 @@ async fn run() -> anyhow::Result<()> {
     tracing::info!(%node_id, %hostname, kiln = %opts.kiln, "ingot starting");
 
     let disks = disk::Disks { dir: opts.state_dir.join("disks"), images: images_dir };
+    let (images, fetches) = images::Images::new(disks.hashed_dir());
+    let images = Arc::new(images);
     let hv = native_hypervisor(&opts, disks)?;
     let reserve = Capacity { vcpus: opts.reserve_vcpus, memory_mb: opts.reserve_memory_mb, disk_gb: opts.reserve_disk_gb };
-    let reconciler = Arc::new(Mutex::new(Reconciler::new(hv, reserve)));
+    let reconciler = Arc::new(Mutex::new(Reconciler::new(hv, reserve).with_images(images.clone())));
 
     // Loading the cache validates it, but only a fresh authenticated response
     // authorizes resource changes. Existing VMs keep running while disconnected.
     let cached = state::load_desired(&opts.state_dir)?;
     let token = identity::load_or_create_token(&opts.state_dir)?;
     let kiln = Kiln::new(&opts.kiln, node_id, token);
+    // Downloads are only requested by reconciliation, which only runs on a
+    // fresh authorized desired state.
+    tokio::spawn(images::fetch_loop(kiln.clone(), images, fetches));
     let register = RegisterRequest { node_id, hostname, arch, capacity: snapshot_capacity(&reconciler, cached.clone()).await };
     register_until_approved(&kiln, &register).await?;
 

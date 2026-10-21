@@ -58,6 +58,21 @@ const MIGRATIONS: &[&str] = &[
     "#,
     "ALTER TABLE nodes ADD COLUMN token_hash TEXT;
      UPDATE nodes SET status = 'pending', last_seen = NULL WHERE status = 'approved';",
+    // v3: image catalogue, per-node overcommit, spread groups.
+    r#"
+    CREATE TABLE images (
+        name       TEXT NOT NULL,
+        arch       TEXT NOT NULL,
+        sha256     TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (name, arch)
+    );
+    ALTER TABLE nodes ADD COLUMN cpu_ratio REAL NOT NULL DEFAULT 1.0;
+    ALTER TABLE nodes ADD COLUMN memory_ratio REAL NOT NULL DEFAULT 1.0;
+    ALTER TABLE nodes ADD COLUMN disk_ratio REAL NOT NULL DEFAULT 1.0;
+    ALTER TABLE instances ADD COLUMN spread TEXT;
+    "#,
 ];
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
@@ -214,6 +229,7 @@ pub struct NodeRow {
     pub last_seen: Option<i64>,
     pub capacity: Capacity,
     pub token_hash: Option<String>,
+    pub overcommit: Overcommit,
 }
 
 impl NodeRow {
@@ -229,8 +245,16 @@ impl NodeRow {
             NodeDbStatus::Approved => NodeStatus::Offline,
         }
     }
-    pub fn to_api(&self) -> Node {
-        Node { id: self.id, hostname: self.hostname.clone(), arch: self.arch, status: self.public_status() }
+    pub fn to_api(&self, allocated: Capacity) -> Node {
+        Node {
+            id: self.id,
+            hostname: self.hostname.clone(),
+            arch: self.arch,
+            status: self.public_status(),
+            capacity: Some(self.capacity.clone()),
+            allocated: Some(allocated),
+            overcommit: self.overcommit,
+        }
     }
 }
 
@@ -245,10 +269,11 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
         capacity: serde_json::from_str(&r.get::<_, String>(6)?)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?,
         token_hash: r.get(7)?,
+        overcommit: Overcommit { cpu: r.get(8)?, memory: r.get(9)?, disk: r.get(10)? },
     })
 }
 
-const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash";
+const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio";
 
 pub fn node(conn: &Connection, id: NodeId) -> rusqlite::Result<Option<NodeRow>> {
     conn.query_row(&format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"), [id.to_string()], node_from_row).optional()
@@ -290,6 +315,14 @@ pub fn set_node_status(conn: &Connection, id: NodeId, status: NodeDbStatus) -> r
     Ok(conn.execute("UPDATE nodes SET status = ?1 WHERE id = ?2", params![enum_to_text(&status), id.to_string()])? == 1)
 }
 
+pub fn set_overcommit(conn: &Connection, id: NodeId, oc: &Overcommit) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE nodes SET cpu_ratio = ?1, memory_ratio = ?2, disk_ratio = ?3 WHERE id = ?4",
+        params![oc.cpu, oc.memory, oc.disk, id.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn bump_generation(conn: &Connection, id: NodeId) -> rusqlite::Result<()> {
     conn.execute("UPDATE nodes SET generation = generation + 1 WHERE id = ?1", [id.to_string()])?;
     Ok(())
@@ -314,6 +347,8 @@ pub struct InstanceRow {
     pub desired: DesiredState,
     pub spec: InstanceSpec,
     pub observed: Option<ObservedInstance>,
+    /// Spread group within the project, used only by placement.
+    pub spread: Option<String>,
 }
 
 fn instance_from_row(r: &Row) -> rusqlite::Result<InstanceRow> {
@@ -329,14 +364,15 @@ fn instance_from_row(r: &Row) -> rusqlite::Result<InstanceRow> {
             Some(s) => Some(serde_json::from_str(&s).map_err(|e| conv(6, e))?),
             None => None,
         },
+        spread: r.get(7)?,
     })
 }
 
-const INSTANCE_COLS: &str = "id, project_id, name, node_id, desired_state, spec_json, observed_json";
+const INSTANCE_COLS: &str = "id, project_id, name, node_id, desired_state, spec_json, observed_json, spread";
 
 pub fn insert_instance(conn: &Connection, row: &InstanceRow) -> rusqlite::Result<()> {
     conn.execute(
-        &format!("INSERT INTO instances ({INSTANCE_COLS}, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)"),
+        &format!("INSERT INTO instances ({INSTANCE_COLS}, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)"),
         params![
             row.id.to_string(),
             row.project_id.to_string(),
@@ -344,9 +380,15 @@ pub fn insert_instance(conn: &Connection, row: &InstanceRow) -> rusqlite::Result
             row.node_id.to_string(),
             enum_to_text(&row.desired),
             serde_json::to_string(&row.spec).unwrap(),
+            row.spread,
             now()
         ],
     )?;
+    Ok(())
+}
+
+pub fn set_spec(conn: &Connection, id: InstanceId, spec: &InstanceSpec) -> rusqlite::Result<()> {
+    conn.execute("UPDATE instances SET spec_json = ?1 WHERE id = ?2", params![serde_json::to_string(spec).unwrap(), id.to_string()])?;
     Ok(())
 }
 
@@ -401,6 +443,41 @@ pub fn fail_instances_on_node(conn: &Connection, node: NodeId, reason: &str) -> 
         set_observed(conn, &obs)?;
     }
     Ok(())
+}
+
+// ---- image catalogue -----------------------------------------------------------
+
+fn image_from_row(r: &Row) -> rusqlite::Result<Image> {
+    Ok(Image { name: r.get(0)?, arch: text_to_enum(&r.get::<_, String>(1)?)?, sha256: r.get(2)?, size_bytes: r.get::<_, i64>(3)? as u64 })
+}
+
+/// Point a name and arch at a blob. Instances keep the hash they were created
+/// with, so re-importing a name never changes existing disks.
+pub fn upsert_image(conn: &Connection, image: &Image) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO images (name, arch, sha256, size_bytes, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(name, arch) DO UPDATE SET sha256 = excluded.sha256, size_bytes = excluded.size_bytes, created_at = excluded.created_at",
+        params![image.name, enum_to_text(&image.arch), image.sha256, image.size_bytes as i64, now()],
+    )?;
+    Ok(())
+}
+
+pub fn image(conn: &Connection, name: &str, arch: Arch) -> rusqlite::Result<Option<Image>> {
+    conn.query_row("SELECT name, arch, sha256, size_bytes FROM images WHERE name = ?1 AND arch = ?2",
+        params![name, enum_to_text(&arch)], image_from_row).optional()
+}
+
+pub fn list_images(conn: &Connection) -> rusqlite::Result<Vec<Image>> {
+    conn.prepare("SELECT name, arch, sha256, size_bytes FROM images ORDER BY name, arch")?
+        .query_map([], image_from_row)?.collect()
+}
+
+/// A blob may be served if any catalogue entry or any instance refers to it.
+pub fn blob_referenced(conn: &Connection, sha256: &str) -> rusqlite::Result<bool> {
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM images WHERE sha256 = ?1)", [sha256], |r| r.get(0))? {
+        return Ok(true);
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM instances WHERE json_extract(spec_json, '$.boot_disk.sha256') = ?1)", [sha256], |r| r.get(0))
 }
 
 pub fn list_all_projects(conn: &Connection) -> rusqlite::Result<Vec<(Project, String)>> {

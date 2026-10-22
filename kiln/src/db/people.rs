@@ -171,6 +171,7 @@ pub fn delete_user(conn: &Connection, user: Uuid) -> rusqlite::Result<()> {
     let id = user.to_string();
     conn.execute("DELETE FROM sessions WHERE user_id = ?1", [&id])?;
     conn.execute("DELETE FROM tokens WHERE user_id = ?1", [&id])?;
+    conn.execute("DELETE FROM ssh_keys WHERE user_id = ?1", [&id])?;
     conn.execute("DELETE FROM invites WHERE created_by = ?1", [&id])?;
     conn.execute("DELETE FROM projects WHERE owner_id = ?1", [&id])?;
     conn.execute("DELETE FROM users WHERE id = ?1", [&id])?;

@@ -22,6 +22,8 @@ clap.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
+# Decoding SSH public keys to fingerprint them.
+base64 = "0.22"
 rand = "0.9"
 argon2 = "0.5"
 libc = "0.2"

@@ -5,7 +5,7 @@ use copper_api::*;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtleWZvcnRoZWtpbG50ZXN0czAwMDAwMDAwMDAw alice@laptop";
+const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFj/NbTgjOM0L/Sk0uGgwW9NGFVuPaS91tElolgH/nmC alice@laptop";
 
 struct Fixture {
     state: AppState,
@@ -503,6 +503,28 @@ async fn a_vm_needs_a_public_ssh_key() {
     // The dry run doesn't need one: the console checks a shape before the key is in.
     assert_eq!(f.call("POST", &format!("{create}/check"), &f.user, body(json!([]))).await.0, StatusCode::OK);
     assert_eq!(f.call("POST", create, &f.user, body(json!([KEY]))).await.0, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn saved_keys_go_into_vms_that_name_none() {
+    let f = Fixture::new();
+    let (status, key) = f.call("POST", "/v1/keys", &f.user, json!({"public_key": KEY})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!((key["name"].as_str(), key["fingerprint"].as_str()), (Some("alice@laptop"), Some("SHA256:ARQPlI2pp175E3pLrJpmwPKuVA/HFV/dmIQTvtceRa8")));
+    let (status, err) = f.call("POST", "/v1/keys", &f.user, json!({"public_key": KEY, "name": "again"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(err["message"].as_str().unwrap().contains("alice@laptop"));
+    assert_eq!(f.call("POST", "/v1/keys", &f.user, json!({"public_key": "-----BEGIN OPENSSH PRIVATE KEY-----"})).await.0, StatusCode::BAD_REQUEST);
+    // Keys are personal, even from admins.
+    assert_eq!(f.call("GET", "/v1/keys", &f.admin, Value::Null).await.1, json!([]));
+    let id = key["id"].as_str().unwrap();
+    assert_eq!(f.call("DELETE", &format!("/v1/keys/{id}"), &f.admin, Value::Null).await.0, StatusCode::NOT_FOUND);
+    // A create with no keys gets the saved ones.
+    let body = json!({"name":"vm","vcpus":1,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5});
+    assert_eq!(f.call("POST", "/v1/projects/default/instances", &f.user, body).await.0, StatusCode::CREATED);
+    assert_eq!(f.instance_row("vm").spec.ssh_keys, vec![KEY.to_string()]);
+    assert_eq!(f.call("DELETE", &format!("/v1/keys/{id}"), &f.user, Value::Null).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(f.instance_row("vm").spec.ssh_keys, vec![KEY.to_string()], "a VM keeps what it was given");
 }
 
 #[tokio::test]

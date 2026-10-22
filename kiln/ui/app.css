@@ -194,6 +194,7 @@ table.list td.act { text-align: right; padding-right: 0; }
 table.list td.act .btn + .btn { margin-left: 6px; }
 table.list tr.link { cursor: pointer; }
 table.list tr.link:hover td { background: var(--p1); }
+.key-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; }
 .invite-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: end; gap: 16px; }
 @media (max-width: 760px) { .invite-row { grid-template-columns: 1fr; } }
 .links a { color: var(--fg1); text-underline-offset: 3px; text-decoration-color: var(--fg4); }

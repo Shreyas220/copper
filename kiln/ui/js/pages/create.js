@@ -4,6 +4,7 @@ import { gb, plural } from '../format.js';
 import { isAdmin, projectPath, session } from '../session.js';
 import { act, button, copyBlock, crumb, dot, fig, input, kv, notice, st, title } from '../ui.js';
 import { firstProject, instanceHref } from './common.js';
+import { addKeys, keyType } from './keys.js';
 
 const SHAPES = [
   { id: 'smol', vcpus: 1, memory_gb: 1 },
@@ -11,22 +12,17 @@ const SHAPES = [
   { id: 'chonky', vcpus: 4, memory_gb: 8 },
 ];
 const NAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
-// What kiln accepts: one line of an OpenSSH public key, as in ~/.ssh/id_ed25519.pub.
-const KEY = /^(ssh-|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)\S*\s+[A-Za-z0-9+/=]{16,}(\s[^\n\r]*)?$/;
-const KEY_STORE = 'copper.ssh-key';
 
 /** New VM, as one page of steps. Every change asks kiln for a fresh dry run;
  *  nothing is created until the button at the bottom. */
 export default async function create(ctx) {
   if (!session.project) return firstProject();
   const admin = isAdmin();
-  const [images, nodes, inUse] = await Promise.all([get('/v1/images'), admin ? get('/v1/nodes') : Promise.resolve([]), imageUse()]);
-  let savedKey = '';
-  try { savedKey = localStorage.getItem(KEY_STORE) ?? ''; } catch { /* no storage: type it */ }
+  const [images, nodes, inUse, saved] = await Promise.all([get('/v1/images'), admin ? get('/v1/nodes') : Promise.resolve([]), imageUse(), get('/v1/keys')]);
   // Start from the image most VMs here already use.
   const usual = [...images].sort((a, b) => (inUse[b.name] ?? 0) - (inUse[a.name] ?? 0))[0];
   const want = {
-    name: '', ssh_key: savedKey, project: session.project, image: usual?.name ?? 'ubuntu-24.04', arch: usual?.arch ?? 'x86_64',
+    name: '', key: saved[0] ?? null, project: session.project, image: usual?.name ?? 'ubuntu-24.04', arch: usual?.arch ?? 'x86_64',
     shape: 'regular', vcpus: 2, memory_gb: 2, disk_gb: 20, placement: 'pick', node: '', spread: '',
   };
   let fit = null;
@@ -46,14 +42,28 @@ export default async function create(ctx) {
   });
   const project = h('select', { class: 'input' }, session.projects.map((p) => h('option', { value: projectPath(p), selected: projectPath(p) === want.project }, projectPath(p))));
   project.addEventListener('change', () => { want.project = project.value; changed(); });
-  const key = input({ value: want.ssh_key, placeholder: 'ssh-ed25519 AAAA… you@laptop', spellcheck: 'false', required: true });
-  key.addEventListener('input', () => {
-    want.ssh_key = key.value.trim();
-    key.setAttribute('aria-invalid', want.ssh_key && !KEY.test(want.ssh_key) ? 'true' : 'false');
+  // The VM gets one of your saved keys; "add a key…" makes or saves one here.
+  const keyPick = h('select', { class: 'input' });
+  const adding = h('div');
+  const drawKeys = () => fill(keyPick,
+    saved.map((k) => h('option', { value: k.id, selected: want.key?.id === k.id }, `${k.name} · ${keyType(k)}`)),
+    h('option', { value: '', selected: !want.key }, 'add a key…'));
+  const showAdding = () => fill(adding, want.key ? null : addKeys(() => saved, (k) => {
+    saved.push(k);
+    want.key = k;
+    drawKeys();
+    update();
+  }));
+  keyPick.addEventListener('change', () => {
+    want.key = saved.find((k) => k.id === keyPick.value) ?? null;
+    showAdding();
     update();
   });
+  drawKeys();
+  showAdding();
   blocks.name = h('div', { class: 'step' },
-    h('div', { class: 'cells three flat' }, field('name', name, h('span', { class: 'hint' }, 'a-z 0-9 -')), field('project', project), field('ssh key', key)),
+    h('div', { class: 'cells three flat' }, field('name', name, h('span', { class: 'hint' }, 'a-z 0-9 -')), field('project', project), field('ssh key', keyPick)),
+    adding,
     h('div', { class: 'row' }, next('name')));
 
   // ---- 02 image ----
@@ -141,13 +151,9 @@ export default async function create(ctx) {
   const make = button('create vm ›', { primary: true, disabled: true });
   make.addEventListener('click', async () => {
     const made = await act(make, () => post(`/v1/projects/${enc(want.project)}/instances`, request(false)), `${want.name} is starting`);
-    if (made) {
-      try { localStorage.setItem(KEY_STORE, want.ssh_key); } catch { /* fine */ }
-      location.hash = instanceHref(made.name);
-    }
+    if (made) location.hash = instanceHref(made.name);
   });
   const named = () => want.name && NAME.test(want.name);
-  const keyed = () => KEY.test(want.ssh_key);
   const shapeText = () => `${want.vcpus} vcpu · ${want.memory_gb} gb · ${want.disk_gb} gb`;
   const nodeText = () => (want.placement === 'pin' ? nodes.find((n) => n.id === want.node)?.hostname ?? '—' : want.placement === 'spread' ? `spread · ${want.spread || '—'}` : 'copper picks');
   const SUMMARY = {
@@ -171,12 +177,12 @@ export default async function create(ctx) {
     fill(fitBox, admin && fit?.nodes ? fitFigure() : null);
     fill(refusal, fit && !fit.fits ? wontFit(over) : null);
     fill(dryRun, copyBlock('dry run', dryRunLines()));
-    fill(summary, kv([['name', want.name || '—'], ['image', want.image], ['arch', want.arch], ['shape', shapeText()], ['project', want.project], admin ? ['node', nodeText()] : null]));
+    fill(summary, kv([['name', want.name || '—'], ['image', want.image], ['arch', want.arch], ['shape', shapeText()], ['project', want.project],
+      ['ssh key', want.key ? `${want.key.name} · ${keyType(want.key)}` : '—'], admin ? ['node', nodeText()] : null]));
     make.textContent = `create ${want.name || 'vm'} ›`;
-    make.disabled = !(named() && keyed() && fit?.fits);
+    make.disabled = !(named() && want.key && fit?.fits);
     const verdict = !want.name ? st('stopped', 'name it first') : !named() ? st('failed', 'name: a-z 0-9 -')
-      : !want.ssh_key ? st('stopped', 'add an ssh key') : !keyed() ? st('failed', 'ssh key: paste a public key, one line')
-      : !fit ? st('starting', 'checking…')
+      : !want.key ? st('stopped', 'add an ssh key') : !fit ? st('starting', 'checking…')
       : fit.fits ? st('running', 'fits') : st('failed', over.vcpus ? `won't fit · ${want.vcpus} > ${L.vcpus} vcpu` : "won't fit");
     fill(bar, verdict, button('cancel', { href: '#/instances' }), make);
   }
@@ -247,7 +253,7 @@ export default async function create(ctx) {
     return {
       name: named() ? want.name : check ? 'vm' : want.name,
       vcpus: want.vcpus, memory_mb: want.memory_gb * 1024, arch: want.arch, image: want.image, disk_gb: want.disk_gb,
-      ssh_keys: keyed() ? [want.ssh_key] : [],
+      ssh_keys: want.key ? [want.key.public_key] : [],
       node: admin && want.placement === 'pin' && want.node ? want.node : undefined,
       spread: admin && want.placement === 'spread' && want.spread ? want.spread : undefined,
     };

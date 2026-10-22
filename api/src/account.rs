@@ -95,6 +95,27 @@ pub struct NewToken {
     pub secret: String,
 }
 
+/// An SSH public key saved by its owner. A create that names no keys puts the
+/// caller's saved keys into the VM. Kiln never holds private keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshKey {
+    pub id: String,
+    pub name: String,
+    /// One line, as in `~/.ssh/id_ed25519.pub`.
+    pub public_key: String,
+    /// `SHA256:…`, as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddSshKey {
+    pub public_key: String,
+    /// Defaults to the key's comment, such as `you@laptop`.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Passwords are long enough to resist guessing over the network, and short
 /// enough to type.
 pub const MIN_PASSWORD_LEN: usize = 10;

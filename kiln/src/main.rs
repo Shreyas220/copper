@@ -11,6 +11,7 @@ mod catalog;
 mod console;
 mod db;
 mod error;
+mod keys_api;
 mod metrics;
 mod node_api;
 mod nodes_api;
@@ -146,6 +147,7 @@ impl AppState {
             .merge(nodes_api::router())
             .merge(ops_api::router())
             .merge(people_api::router())
+            .merge(keys_api::router())
             .merge(ui::router())
             .with_state(self.clone())
     }

@@ -47,6 +47,7 @@ Then approve the node and make a VM:
 export CU_URL=http://kiln:8400 CU_TOKEN=cu_...
 cu node ls && cu node approve <id>
 cu project create default
+cu key add                         # save ~/.ssh/id_ed25519.pub, or `cu key new` to make a key
 cu create web --vcpus 2 --memory 2048
 cu ls
 cu ssh web                         # through kiln, so it works over the tailnet too

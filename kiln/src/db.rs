@@ -116,11 +116,25 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX events_by_instance ON events(instance_id, id);
     CREATE INDEX events_by_project ON events(project_id, id);
     "#,
+    // v5: saved SSH public keys, used when a create names none.
+    r#"
+    CREATE TABLE ssh_keys (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(id),
+        name        TEXT NOT NULL,
+        public_key  TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        UNIQUE (user_id, fingerprint)
+    );
+    "#,
 ];
 
 mod events;
+mod keys;
 mod people;
 pub use events::*;
+pub use keys::*;
 pub use people::*;
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {

@@ -4,6 +4,10 @@ xterm.js 5.5.0 (vendor/xterm.js, vendor/xterm.css)
   https://github.com/xtermjs/xterm.js · MIT License
   Copyright (c) 2017-2019, The xterm.js authors; (c) 2014-2016, SourceLair; (c) 2012-2013, Christopher Jeffrey
 
+TweetNaCl.js 1.0.3 (vendor/nacl.min.js), for making SSH keys in the browser
+  https://github.com/dchest/tweetnacl-js · The Unlicense (public domain)
+  npm integrity sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw==
+
 Geist (fonts/geist.woff2)
   https://github.com/vercel/geist-font · SIL Open Font License 1.1
 

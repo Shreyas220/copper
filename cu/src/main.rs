@@ -43,7 +43,8 @@ enum Cmd {
         disk: u64,
         #[arg(long, default_value = "x86_64")]
         arch: String,
-        /// SSH public key (text or path). Repeatable. Defaults to ~/.ssh/*.pub.
+        /// SSH public key (text or path). Repeatable. Defaults to your saved
+        /// keys (`cu key ls`), or ~/.ssh/*.pub when you have none saved.
         #[arg(long = "ssh-key")]
         ssh_keys: Vec<String>,
         /// Admin: place on exactly this node, or refuse.
@@ -114,6 +115,30 @@ enum Cmd {
     /// Admin: nodes
     #[command(subcommand)]
     Node(NodeCmd),
+    /// Your saved SSH keys, which VMs you create get unless you pass --ssh-key
+    #[command(subcommand)]
+    Key(KeyCmd),
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    Ls,
+    /// Save a public key you have: a .pub file, the key text, or by default
+    /// your ~/.ssh/id_ed25519.pub (or id_ecdsa.pub, id_rsa.pub)
+    Add {
+        key: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Make a new key pair in ~/.copper/keys and save its public half.
+    /// `cu ssh` uses it from then on
+    New {
+        /// Defaults to this machine's hostname.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Forget a saved key. VMs that already have it keep it
+    Rm { id: String },
 }
 
 #[derive(Subcommand)]
@@ -348,9 +373,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Create { name, vcpus, memory, image, disk, arch, ssh_keys, node, spread } => {
             let arch: Arch = serde_json::from_value(serde_json::Value::String(arch)).context("arch must be x86_64 or aarch64")?;
-            let ssh_keys = resolve_ssh_keys(ssh_keys)?;
-            if ssh_keys.is_empty() {
-                bail!("no ssh key in ~/.ssh/*.pub; make one with ssh-keygen or pass --ssh-key");
+            let named = !ssh_keys.is_empty();
+            let mut ssh_keys = resolve_ssh_keys(ssh_keys)?;
+            if !named {
+                // Saved keys win: kiln puts them in when the request names none.
+                let saved: Vec<SshKey> = c.call(Method::GET, "/v1/keys", None).await?;
+                if !saved.is_empty() {
+                    ssh_keys.clear();
+                } else if ssh_keys.is_empty() {
+                    bail!("no ssh key: save one you have with `cu key add`, or make one with `cu key new`");
+                }
             }
             let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk, ssh_keys, node, spread })?;
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances"), Some(body)).await?;
@@ -370,8 +402,11 @@ async fn main() -> anyhow::Result<()> {
                 .arg("-o").arg(format!("ProxyCommand={}", proxy_command(&c.url, p, &name)?))
                 // Addresses get reused; the instance id never does.
                 .arg("-o").arg(format!("HostKeyAlias=copper-{}", i.id))
-                .arg("-o").arg("StrictHostKeyChecking=accept-new")
-                .arg("-l").arg(&user)
+                .arg("-o").arg("StrictHostKeyChecking=accept-new");
+            for key in identity_files() {
+                ssh.arg("-i").arg(key);
+            }
+            ssh.arg("-l").arg(&user)
                 .arg(&name)
                 .args(&command);
             // Hand the terminal and signals to ssh.
@@ -384,6 +419,9 @@ async fn main() -> anyhow::Result<()> {
             println!("    User {user}");
             println!("    HostKeyAlias copper-{}", i.id);
             println!("    StrictHostKeyChecking accept-new");
+            for key in identity_files() {
+                println!("    IdentityFile \"{}\"", key.display());
+            }
             println!("    ProxyCommand {}", proxy_command(&c.url, p, &name)?);
         }
         Cmd::Tunnel { name } => {
@@ -453,6 +491,109 @@ async fn main() -> anyhow::Result<()> {
             let n: Node = c.call(Method::POST, &format!("/v1/nodes/{id}/retire"), None).await?;
             println!("{} {} {:?}", n.id, n.hostname, n.status);
         }
+        Cmd::Key(KeyCmd::Ls) => {
+            let keys: Vec<SshKey> = c.call(Method::GET, "/v1/keys", None).await?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+            for k in keys {
+                println!("{}  {:<24} {}  {} ago", k.id, k.name, k.fingerprint, ago(now - k.created_at));
+            }
+        }
+        Cmd::Key(KeyCmd::Add { key, name }) => {
+            let public_key = match key {
+                Some(k) => resolve_ssh_keys(vec![k])?.remove(0),
+                None => default_public_key()?,
+            };
+            let k = save_key(&c, public_key, name).await?;
+            println!("saved {} · {}", k.name, k.fingerprint);
+        }
+        Cmd::Key(KeyCmd::New { name }) => {
+            let name = name.unwrap_or_else(short_hostname);
+            let (private, public_key) = new_key_pair(&c, &name).await?;
+            let k = save_key(&c, public_key, Some(name)).await?;
+            println!("saved {} · {}", k.name, k.fingerprint);
+            println!("the private key is {}; cu ssh offers it from now on", private.display());
+        }
+        Cmd::Key(KeyCmd::Rm { id }) => {
+            let () = c.call(Method::DELETE, &format!("/v1/keys/{id}"), None).await?;
+        }
     }
     Ok(())
+}
+
+fn home() -> anyhow::Result<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from).context("HOME is not set")
+}
+
+/// Where `cu key new` keeps the key pairs it makes.
+fn keys_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home()?.join(".copper").join("keys"))
+}
+
+/// Private keys to offer ssh. Naming any IdentityFile stops ssh trying its
+/// own defaults, so those are listed too, ahead of the ones cu made. Without
+/// cu-made keys this is empty and ssh behaves as it always does.
+fn identity_files() -> Vec<std::path::PathBuf> {
+    let mut ours: Vec<_> = keys_dir()
+        .and_then(|d| Ok(std::fs::read_dir(d)?))
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().is_none_or(|x| x != "pub")).collect())
+        .unwrap_or_default();
+    if ours.is_empty() {
+        return ours;
+    }
+    ours.sort();
+    let defaults = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk"];
+    let ssh = home().map(|h| h.join(".ssh")).unwrap_or_default();
+    defaults.iter().map(|n| ssh.join(n)).filter(|p| p.is_file()).chain(ours).collect()
+}
+
+/// The key someone most likely means: their usual ~/.ssh one.
+fn default_public_key() -> anyhow::Result<String> {
+    let ssh = home()?.join(".ssh");
+    for name in ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub", "id_ed25519_sk.pub", "id_ecdsa_sk.pub"] {
+        if let Ok(text) = std::fs::read_to_string(ssh.join(name)) {
+            return Ok(text.trim().to_string());
+        }
+    }
+    bail!("no key in ~/.ssh; make one with `cu key new`, or name a .pub file")
+}
+
+fn short_hostname() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "laptop".into())
+}
+
+/// Run ssh-keygen for a new ed25519 pair in ~/.copper/keys/<name>. It asks
+/// for a passphrase itself; an empty one is allowed.
+async fn new_key_pair(c: &Client, name: &str) -> anyhow::Result<(std::path::PathBuf, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let file: String = name.chars().map(|ch| if ch.is_ascii_alphanumeric() || "._-".contains(ch) { ch } else { '-' }).collect();
+    let dir = keys_dir()?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let private = dir.join(&file);
+    if private.exists() {
+        bail!("{} already exists; pick another --name", private.display());
+    }
+    let me: Me = c.call(Method::GET, "/v1/me", None).await?;
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-C", &format!("{}@{name} (copper)", me.name), "-f"])
+        .arg(&private)
+        .status()
+        .context("running ssh-keygen")?;
+    if !status.success() {
+        bail!("ssh-keygen failed");
+    }
+    let public = std::fs::read_to_string(dir.join(format!("{file}.pub")))?;
+    Ok((private, public.trim().to_string()))
+}
+
+async fn save_key(c: &Client, public_key: String, name: Option<String>) -> anyhow::Result<SshKey> {
+    let body = serde_json::to_value(AddSshKey { public_key, name })?;
+    c.call(Method::POST, "/v1/keys", Some(body)).await
 }

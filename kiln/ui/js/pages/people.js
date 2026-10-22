@@ -3,14 +3,20 @@ import { fill, h } from '../dom.js';
 import { ago, plural } from '../format.js';
 import { isAdmin, session } from '../session.js';
 import { act, button, copyBlock, empty, field, input, subtitle, table, title } from '../ui.js';
+import { keysSection } from './keys.js';
 
-/** People and tokens. Admins invite people and see everyone's tokens;
- *  everyone manages their own tokens for cu. */
+/** People, keys and tokens. Admins invite people and see everyone's tokens;
+ *  everyone manages their own SSH keys and their own tokens for cu. */
 export default async function people() {
-  const [users, tokens] = await Promise.all([isAdmin() ? get('/v1/users') : Promise.resolve(null), get('/v1/tokens')]);
+  const [users, keys, tokens] = await Promise.all([isAdmin() ? get('/v1/users') : Promise.resolve(null), get('/v1/keys'), get('/v1/tokens')]);
+  const heading = h('div', { class: 'head' });
+  const count = (nkeys) => fill(heading, title('Users & tokens.',
+    `${[users ? plural(users.length, 'person', 'people') : null, plural(nkeys, 'key'), plural(tokens.length, 'token')].filter(Boolean).join(', ')}.`));
+  count(keys.length);
   return [
-    h('section', {}, h('div', { class: 'head' }, title('Users & tokens.', users ? `${plural(users.length, 'person', 'people')}, ${plural(tokens.length, 'token')}.` : `${plural(tokens.length, 'token')}.`))),
+    h('section', {}, heading),
     users ? h('section', {}, peopleList(users)) : null,
+    h('section', { id: 'keys' }, keysSection(keys, count)),
     h('section', {}, tokenList(tokens)),
   ];
 }

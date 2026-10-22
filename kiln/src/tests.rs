@@ -523,6 +523,8 @@ async fn saved_keys_go_into_vms_that_name_none() {
     let body = json!({"name":"vm","vcpus":1,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5});
     assert_eq!(f.call("POST", "/v1/projects/default/instances", &f.user, body).await.0, StatusCode::CREATED);
     assert_eq!(f.instance_row("vm").spec.ssh_keys, vec![KEY.to_string()]);
+    let (_, vm) = f.call("GET", "/v1/projects/default/instances/vm", &f.user, Value::Null).await;
+    assert_eq!(vm["ssh_keys"], json!([{"fingerprint": "SHA256:ARQPlI2pp175E3pLrJpmwPKuVA/HFV/dmIQTvtceRa8", "comment": "alice@laptop"}]));
     assert_eq!(f.call("DELETE", &format!("/v1/keys/{id}"), &f.user, Value::Null).await.0, StatusCode::NO_CONTENT);
     assert_eq!(f.instance_row("vm").spec.ssh_keys, vec![KEY.to_string()], "a VM keeps what it was given");
 }

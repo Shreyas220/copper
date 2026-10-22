@@ -5,7 +5,7 @@ import { ago, bytes, percent, shape, since } from '../format.js';
 import { icon } from '../icons.js';
 import { isAdmin, session } from '../session.js';
 import { act, button, copyBlock, crumb, dot, empty, field, input, notice, pill, props, spark, st, subtitle, title, toast } from '../ui.js';
-import { instanceUrl, stopThenStart } from './common.js';
+import { instanceUrl, projectUrl, stopThenStart } from './common.js';
 
 const TABS = ['overview', 'history', 'console', 'metrics'];
 
@@ -13,6 +13,12 @@ export default async function instance(ctx, name) {
   let inst = await get(instanceUrl(name));
   // Admins get the node record too, to draw the machine the VM is on.
   let nodes = isAdmin() ? await get('/v1/nodes') : [];
+  // Your saved keys name the VM's keys, and are what a recreate puts in.
+  const mine = await get('/v1/keys');
+  // Recreating deletes the VM for a moment; the refresh must not take that
+  // for the VM being gone.
+  let paused = false;
+  const page = { mine, pause: (p) => (paused = p) };
   let tab = 'overview';
   let leaveTab = () => {};
   const header = h('div', { class: 'split-head' });
@@ -28,11 +34,12 @@ export default async function instance(ctx, name) {
     leaveTab = () => {};
     tab = t;
     drawTabs();
-    const page = { overview, history, console: serialConsole, metrics }[t](inst, refresh);
-    fill(body, page.node);
-    leaveTab = page.leave ?? (() => {});
+    const shown = { overview, history, console: serialConsole, metrics }[t](inst, refresh, page);
+    fill(body, shown.node);
+    leaveTab = shown.leave ?? (() => {});
   };
   async function refresh() {
+    if (paused) return;
     try {
       inst = await get(instanceUrl(name));
       if (isAdmin()) nodes = await get('/v1/nodes');
@@ -80,7 +87,7 @@ function heading(inst, refresh) {
     inst.error && inst.state !== 'running' ? notice(inst.error, inst.state === 'failed' ? 'bad' : 'warm') : null,
     h('div', { class: 'row', style: { gap: '8px', marginTop: '6px' } },
       // Connect only exists while it runs; see connect() below.
-      inst.state === 'running' ? button('connect ›', { primary: true, onclick: () => document.getElementById('connect')?.scrollIntoView({ behavior: 'smooth' }) }) : null,
+      inst.state === 'running' ? button(inst.ssh_keys.length ? 'connect ›' : 'fix ssh ›', { primary: true, onclick: () => document.getElementById('connect')?.scrollIntoView({ behavior: 'smooth' }) }) : null,
       toggle,
       button('delete', { danger: true, onclick: () => document.getElementById('delete')?.scrollIntoView({ behavior: 'smooth' }) })));
 }
@@ -105,14 +112,82 @@ async function change(btn, inst, what, refresh) {
 
 // ---- overview tab ----------------------------------------------------------------
 
-function overview(inst, refresh) {
+function overview(inst, refresh, page) {
   return {
     node: h('div', {},
-      connect(inst),
+      inst.ssh_keys.length ? connect(inst) : noKey(inst, refresh, page),
       h('section', {}, resize(inst, refresh)),
-      h('section', {}, h('div', { class: 'head', style: { paddingTop: '56px' } }, subtitle('Properties.')), properties(inst)),
+      h('section', {}, h('div', { class: 'head', style: { paddingTop: '56px' } }, subtitle('Properties.')), properties(inst, page.mine)),
       h('section', {}, remove(inst))),
   };
+}
+
+/** One of the VM's keys, by the name you saved it under when it's yours. */
+const keyName = (k, mine) => mine.find((m) => m.fingerprint === k.fingerprint)?.name ?? k.comment ?? `${k.fingerprint.slice(0, 15)}…`;
+
+/** A VM made without an SSH key: nobody can log in, and keys are only
+ *  written at first boot, so the fix is to make it again with your keys. */
+function noKey(inst, refresh, page) {
+  const { mine } = page;
+  const fix = h('div');
+  const start = button(`recreate ${inst.name} ›`, { warm: true, disabled: !mine.length });
+  start.addEventListener('click', () => {
+    const confirm = input({ placeholder: inst.name, autocomplete: 'off', 'aria-label': `type ${inst.name} to recreate it` });
+    const go = button('recreate for good', { danger: true, type: 'submit', disabled: true });
+    confirm.addEventListener('input', () => (go.disabled = confirm.value !== inst.name));
+    const form = h('form', { class: 'row', style: { alignItems: 'flex-end', maxWidth: '640px' } },
+      h('div', { style: { flex: '1' } }, field(`its ${inst.disk_gb} gb disk is erased · type ${inst.name}`, confirm)), go);
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      page.pause(true);
+      const made = await act(go, () => recreate(inst, (t) => (go.textContent = t)), `${inst.name} is starting again, with your keys`);
+      page.pause(false);
+      if (!made) {
+        go.textContent = 'recreate for good';
+        return;
+      }
+      // The overview only redraws when nothing in it has focus.
+      document.activeElement?.blur();
+      refresh();
+    });
+    fill(fix, form);
+    confirm.focus();
+  });
+  const flag = session.project === 'default' ? '' : ` --project ${session.project}`;
+  return h('section', { id: 'connect' },
+    h('div', { class: 'head', style: { paddingTop: '56px' } }, subtitle('No SSH key.', `Nobody can log in to ${inst.name}.`)),
+    h('div', { class: 'pad', style: { paddingTop: 0 } }, h('div', { class: 'looks' },
+      step('01', 'save an ssh key', mine.length ? st('running', `yours: ${mine.map((k) => k.name).join(', ')}`) : st('stopped', 'you have none saved'),
+        mine.length ? null : button('add one ›', { small: true, href: '#/people' })),
+      step('02', `recreate ${inst.name} with it`, h('span', { class: 'hint' }, `same shape and image, new disk · cu rm ${inst.name} && cu create ${inst.name}`), start),
+      step('03', 'connect', h('span', { class: 'hint' }, `cu${flag} ssh ${inst.name}`), null)),
+      fix));
+}
+
+function step(n, what, detail, action) {
+  return h('div', { class: 'look' }, h('span', { class: 'when' }, n), h('div', {}, h('div', { class: 'name' }, what), detail), action ?? h('span'));
+}
+
+/** Delete, wait for the node to let it go, then make it again with the
+ *  caller's saved keys: a create that names none gets them. */
+async function recreate(inst, progress) {
+  progress('deleting…');
+  await del(instanceUrl(inst.name));
+  for (let i = 0; ; i++) {
+    try {
+      await get(instanceUrl(inst.name));
+    } catch (e) {
+      if (e.status === 404) break;
+      throw e;
+    }
+    if (i === 90) throw new Error(`${inst.name} is taking a while to go; make it again from new vm`);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  progress('creating…');
+  return post(projectUrl('/instances'), {
+    name: inst.name, vcpus: inst.vcpus, memory_mb: inst.memory_mb, arch: inst.arch, image: inst.image, disk_gb: inst.disk_gb,
+    spread: isAdmin() && inst.spread ? inst.spread : undefined,
+  });
 }
 
 /** Three ways in; the left list picks which commands show on the right. */
@@ -167,7 +242,7 @@ function resize(inst, refresh) {
     h('div', { class: 'pad', style: { paddingTop: 0 } }, form));
 }
 
-function properties(inst) {
+function properties(inst, mine) {
   return props([
     isAdmin() ? ['node', h('a', { href: '#/nodes' }, `${inst.node_name ?? '—'} ›`)] : null,
     ['project', inst.project],
@@ -178,6 +253,7 @@ function properties(inst) {
     ['boot disk', `${inst.disk_gb} GB`],
     ['address', inst.addresses.join(', ') || '—'],
     ['up', inst.running_since ? since(inst.running_since) : '—'],
+    ['ssh keys', inst.ssh_keys.length ? inst.ssh_keys.map((k) => keyName(k, mine)).join(', ') : st('failed', 'none')],
     isAdmin() && inst.spread ? ['spread group', inst.spread] : null,
     ['id', inst.id.slice(0, 8)],
     ['made', `${ago(inst.created_at)} ago by ${inst.owner}`],

@@ -29,9 +29,11 @@ async function sections() {
   const count = (pred) => instances.filter((i) => pred(i.state)).length;
   const running = count((s) => s === 'running');
   const look = instances.filter((i) => NEEDS_LOOK.has(i.state));
+  // Made without a key, so nobody can log in until it's made again.
+  const keyless = instances.filter((i) => !i.ssh_keys.length && i.state !== 'deleting');
   const live = (nodes ?? []).filter((n) => n.status !== 'retired');
   const pending = live.filter((n) => n.status === 'pending');
-  const attention = look.length + pending.length;
+  const attention = look.length + keyless.length + pending.length;
   const headline = instances.length || live.length
     ? `${running} running${attention ? `, ${attention} need${attention === 1 ? 's' : ''} a look` : ''}.`
     : 'Nothing here yet.';
@@ -48,7 +50,7 @@ async function sections() {
       quotaCell(quota))),
     h('section', {}, h('div', { class: 'cells two' },
       nodes ? h('div', { class: 'pad stack', style: { gap: '28px', paddingBottom: '40px' } }, fig(1, 'your cloud'), wiring(live)) : null,
-      h('div', { class: 'pad stack', style: { gap: '28px', paddingBottom: '40px' } }, fig(nodes ? 2 : 1, 'needs a look'), needsLook(look, pending, events, all)))),
+      h('div', { class: 'pad stack', style: { gap: '28px', paddingBottom: '40px' } }, fig(nodes ? 2 : 1, 'needs a look'), needsLook(look, keyless, pending, events, all)))),
     h('section', {},
       h('div', { class: 'head row spread', style: { flexDirection: 'row', paddingTop: '56px' } },
         subtitle('Instances.', `${instances.length} in ${session.project}.`),
@@ -98,8 +100,12 @@ function wiring(nodes) {
 }
 
 /** Failed and unknown instances and waiting nodes, with what to do next. */
-function needsLook(look, pending, events, all) {
+function needsLook(look, keyless, pending, events, all) {
   const rows = [];
+  for (const i of keyless) {
+    const made = events.find((e) => e.instance === i.name && e.kind === 'created');
+    rows.push(item(made ? ago(made.at) : '—', i.name, st('failed', 'no ssh key · nobody can log in'), button('fix ›', { small: true, warm: true, href: instanceHref(i.name) })));
+  }
   for (const n of pending) {
     const asked = all.find((e) => e.kind === 'node wants in' && e.node === n.hostname);
     rows.push(item(asked ? ago(asked.at) : '—', n.hostname, st('warm', `wants in · key ${n.fingerprint ?? '—'}`), button('let it in ›', { small: true, warm: true, href: '#/nodes' })));

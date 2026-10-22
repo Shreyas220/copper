@@ -108,7 +108,17 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
         owner: project.owner.clone(),
         running_since: row.running_since.filter(|_| running),
         usage: metrics.latest(Subject::Instance(row.id)).filter(|_| running),
+        ssh_keys: row.spec.ssh_keys.iter().map(|k| instance_key(k)).collect(),
     })
+}
+
+/// VMs made before keys were checked may hold a line `parse` refuses; it is
+/// still listed, so the VM doesn't look keyless.
+fn instance_key(line: &str) -> InstanceKey {
+    match keys_api::parse(line) {
+        Some(p) => InstanceKey { fingerprint: p.fingerprint, comment: p.comment.map(str::to_string) },
+        None => InstanceKey { fingerprint: "unreadable".into(), comment: line.split_whitespace().nth(2).map(str::to_string) },
+    }
 }
 
 pub fn load(conn: &rusqlite::Connection, auth: &Auth, project: &str, name: &str) -> Result<InstanceRow> {

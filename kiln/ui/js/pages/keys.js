@@ -28,7 +28,9 @@ export function keysSection(initial, onCount) {
   return h('div', { style: { paddingBottom: '28px' } },
     h('div', { class: 'head', style: { paddingTop: '56px' } }, subtitle('SSH keys.', 'For new VMs.')),
     list,
-    h('div', { class: 'pad' }, addKeys(() => keys, refresh)));
+    h('div', { class: 'pad stack', style: { gap: '16px' } },
+      addKeys(() => keys, refresh),
+      copyBlock('the same from a terminal', ['$ cu key add    # saves ~/.ssh/id_ed25519.pub', '$ cu key new    # makes a key in ~/.copper/keys', '$ cu key ls'])));
 }
 
 /** Make one or paste one, side by side. `onSaved(key)` runs after either. */

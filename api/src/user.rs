@@ -76,6 +76,19 @@ pub struct Instance {
     pub running_since: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// The SSH keys written into it at first boot. Empty means nobody can
+    /// log in, and only recreating it changes that.
+    #[serde(default)]
+    pub ssh_keys: Vec<InstanceKey>,
+}
+
+/// A key a VM was made with: enough to recognise it, not the key itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceKey {
+    /// `SHA256:…`, as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

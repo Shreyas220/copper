@@ -110,7 +110,7 @@ async fn ssh_tunnel_needs_the_owner_a_running_instance_and_a_lan_address() {
         "capacity":{"vcpus":1,"memory_mb":1024,"disk_gb":10}});
     assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report).await.0, StatusCode::OK);
     let resp = f.app.clone().oneshot(tunnel(&f.user, path)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "booting, as far as anyone may know: try again");
     let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
     assert!(body["message"].as_str().unwrap().contains("no LAN address"));
 }

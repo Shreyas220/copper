@@ -381,8 +381,9 @@ async fn ssh_tunnel(State(state): State<AppState>, auth: Auth, Path((project, na
         let candidates: Vec<std::net::IpAddr> = inst.addresses.iter().filter_map(|a| a.parse().ok()).filter(|ip| relay_allowed(*ip)).collect();
         (id, candidates)
     };
+    // 503 and 502 both mean "booting, try again"; cu's tunnel retries them.
     if candidates.is_empty() {
-        return Err(Error::conflict("instance has no LAN address yet; try again once it has booted"));
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "instance has no LAN address yet; try again once it has booted".into()));
     }
     // A guest can report several addresses (docker bridges, say); take the
     // first that answers on port 22.

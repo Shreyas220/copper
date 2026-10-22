@@ -217,12 +217,28 @@ fn ago(secs: i64) -> String {
     }
 }
 
-async fn running_instance(c: &Client, project: &str, name: &str) -> anyhow::Result<Instance> {
-    let i: Instance = c.call(Method::GET, &format!("/v1/projects/{project}/instances/{name}"), None).await?;
-    if i.state != InstanceState::Running {
-        bail!("{name} is {}; it must be running", serde_json::to_string(&i.state)?.trim_matches('"'));
+/// The instance once it's running with an address, so `cu create x && cu ssh x`
+/// works: a VM that's still booting is waited for, for up to three minutes.
+async fn reachable_instance(c: &Client, project: &str, name: &str) -> anyhow::Result<Instance> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut said = false;
+    loop {
+        let i: Instance = c.call(Method::GET, &format!("/v1/projects/{project}/instances/{name}"), None).await?;
+        if i.state == InstanceState::Running && !i.addresses.is_empty() {
+            return Ok(i);
+        }
+        if !matches!(i.state, InstanceState::Starting | InstanceState::Running) {
+            bail!("{name} is {}; it must be running", serde_json::to_string(&i.state)?.trim_matches('"'));
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("{name} still has no address after 3 minutes; `cu log {name}` says what happened");
+        }
+        if !said {
+            eprintln!("cu: waiting for {name} to boot…");
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    Ok(i)
 }
 
 /// Poll until kiln no longer knows the instance: its node has removed it.
@@ -260,23 +276,37 @@ async fn check_keys(c: &Client, i: &Instance) -> anyhow::Result<()> {
 }
 
 /// Upgrade an HTTP request to kiln into a byte stream to the instance's SSH
-/// port, then shuttle stdin and stdout across it.
+/// port, then shuttle stdin and stdout across it. While the VM is still
+/// booting (no address yet, or sshd not listening) it retries for a minute.
 async fn tunnel(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let resp = c.http
-        .get(format!("{}/v1/projects/{project}/instances/{name}/ssh", c.url))
-        .bearer_auth(&c.token)
-        .header(reqwest::header::CONNECTION, "upgrade")
-        .header(reqwest::header::UPGRADE, "copper-tcp")
-        .send()
-        .await
-        .context("connecting to kiln")?;
-    let status = resp.status();
-    if status != StatusCode::SWITCHING_PROTOCOLS {
-        let text = resp.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<ApiError>(&text).map(|e| e.message).unwrap_or(text);
-        bail!("{status}: {msg}");
-    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut said = false;
+    let resp = loop {
+        let resp = c.http
+            .get(format!("{}/v1/projects/{project}/instances/{name}/ssh", c.url))
+            .bearer_auth(&c.token)
+            .header(reqwest::header::CONNECTION, "upgrade")
+            .header(reqwest::header::UPGRADE, "copper-tcp")
+            .send()
+            .await
+            .context("connecting to kiln")?;
+        let status = resp.status();
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            break resp;
+        }
+        let booting = matches!(status, StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY);
+        if !booting || std::time::Instant::now() > deadline {
+            let text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<ApiError>(&text).map(|e| e.message).unwrap_or(text);
+            bail!("{status}: {msg}");
+        }
+        if !said {
+            eprintln!("cu: waiting for ssh on {name}…");
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    };
     let (mut from_vm, mut to_vm) = tokio::io::split(resp.upgrade().await.context("opening the tunnel")?);
     tokio::spawn(async move {
         let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut to_vm).await;
@@ -433,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
             print_instance(&i);
         }
         Cmd::Ssh { name, user, command } => {
-            let i = running_instance(&c, p, &name).await?;
+            let i = reachable_instance(&c, p, &name).await?;
             check_keys(&c, &i).await?;
             let mut ssh = std::process::Command::new("ssh");
             // The token reaches the ProxyCommand through the environment,

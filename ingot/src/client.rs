@@ -11,6 +11,9 @@ pub struct Kiln {
     /// Image downloads take minutes, so they get a stall timeout instead of
     /// a total one.
     download: reqwest::Client,
+    /// Sessions (an SSH shell, a serial console) can sit idle for hours, so
+    /// only connecting is timed.
+    sessions: reqwest::Client,
     base: String,
     node_id: NodeId,
     token: String,
@@ -28,27 +31,40 @@ impl Kiln {
             .read_timeout(Duration::from_secs(60))
             .build()
             .unwrap();
-        Self { http, download, base: base.trim_end_matches('/').to_string(), node_id, token }
+        let sessions = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap();
+        Self { http, download, sessions, base: base.trim_end_matches('/').to_string(), node_id, token }
     }
 
-    /// Long-poll for serial console sessions someone opened on this node's VMs.
-    pub async fn console_requests(&self) -> anyhow::Result<Vec<ConsoleRequest>> {
+    /// Long-poll for sessions someone opened on this node's VMs.
+    pub async fn session_requests(&self) -> anyhow::Result<Vec<ConsoleRequest>> {
         let url = format!("{}/nodes/{}/consoles", self.base, self.node_id);
-        Ok(self.http.get(url).bearer_auth(&self.token).send().await?.error_for_status()?.json().await.context("decoding console requests")?)
+        Ok(self.http.get(url).bearer_auth(&self.token).send().await?.error_for_status()?.json().await.context("decoding session requests")?)
     }
 
-    /// Dial kiln back for one console session. The upgraded connection then
-    /// carries the VM's serial console both ways.
-    pub async fn attach_console(&self, session: uuid::Uuid) -> anyhow::Result<reqwest::Upgraded> {
-        let resp = self.download
+    /// Dial kiln back for one session. The upgraded connection then carries
+    /// it both ways, for as long as it lasts, idle or not.
+    pub async fn attach(&self, session: uuid::Uuid) -> anyhow::Result<reqwest::Upgraded> {
+        let resp = self.sessions
             .get(format!("{}/nodes/{}/consoles/{session}", self.base, self.node_id))
             .bearer_auth(&self.token)
             .header(reqwest::header::CONNECTION, "upgrade")
             .header(reqwest::header::UPGRADE, "copper-console")
             .send()
             .await?;
-        anyhow::ensure!(resp.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS, "kiln refused the console: {}", resp.status());
+        anyhow::ensure!(resp.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS, "kiln refused the session: {}", resp.status());
         Ok(resp.upgrade().await?)
+    }
+
+    /// Tell kiln why this node can't carry a session.
+    pub async fn refuse(&self, session: uuid::Uuid, reason: &str) -> anyhow::Result<()> {
+        self.http
+            .post(format!("{}/nodes/{}/consoles/{session}/refuse", self.base, self.node_id))
+            .bearer_auth(&self.token)
+            .json(&SessionRefused { reason: reason.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Download a catalogue blob to `dest`, verifying its SHA-256 on the way.

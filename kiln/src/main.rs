@@ -1,23 +1,24 @@
 //! kiln: the copper control plane. SQLite source of truth, placement, the
 //! node API, the user API and the web console.
 //!
-//! - `node_api`, `console` (node side): what ingot talks to.
-//! - `user_api`, `nodes_api`, `ops_api`, `people_api`: what cu and the
-//!   console talk to.
+//! - `node_api`, `sessions` (node side): what ingot talks to.
+//! - `user_api`, `nodes_api`, `ops_api`, `people_api`, `keys_api`,
+//!   `sessions`: what cu and the console talk to.
 //! - `ui`: the console's static files, built into the binary.
 
 mod auth;
 mod catalog;
-mod console;
 mod db;
 mod error;
 mod keys_api;
 mod metrics;
+mod network;
 mod node_api;
 mod nodes_api;
 mod ops_api;
 mod people_api;
 mod placement;
+mod sessions;
 mod sweeper;
 mod ui;
 mod user_api;
@@ -46,18 +47,20 @@ struct Opts {
 }
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8400";
+const DEFAULT_VM_NETWORK: &str = "10.42.0.0/16";
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Run the daemon (default).
     Serve {
-        /// Addresses to listen on, comma-separated. Bind the Tailscale address,
-        /// and the LAN address too if home machines should reach kiln directly.
+        /// Addresses to listen on, comma-separated: the Tailscale address,
+        /// which is how nodes and people reach kiln, and loopback.
         #[arg(long, env = "KILN_LISTEN", value_delimiter = ',', default_value = DEFAULT_LISTEN)]
         listen: Vec<SocketAddr>,
-        /// Bridge that instance NICs attach to on every node.
-        #[arg(long, env = "KILN_BRIDGE", default_value = "br0")]
-        bridge: String,
+        /// Copper's address space for VMs, a private /16. Each node gets a
+        /// /24 of it. Set it once: nodes and VMs keep the addresses they got.
+        #[arg(long, env = "KILN_VM_NETWORK", default_value = DEFAULT_VM_NETWORK)]
+        vm_network: String,
     },
     /// Create a user (if needed) and print a fresh API token for them.
     /// This is how the first admin is bootstrapped; it needs write access to the DB file.
@@ -121,28 +124,28 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     /// Bumped whenever any node's desired set changes; long-pollers wake and re-check.
     pub changed: tokio::sync::watch::Sender<u64>,
-    pub bridge: String,
+    pub vm_net: network::VmNet,
     pub catalog: PathBuf,
     pub metrics: Arc<metrics::Metrics>,
-    pub consoles: Arc<console::Consoles>,
+    pub sessions: Arc<sessions::Sessions>,
 }
 
 impl AppState {
-    pub fn new(conn: rusqlite::Connection, bridge: String, catalog: PathBuf) -> Self {
+    pub fn new(conn: rusqlite::Connection, vm_net: network::VmNet, catalog: PathBuf) -> Self {
         Self {
             db: Arc::new(Mutex::new(conn)),
             changed: tokio::sync::watch::channel(0).0,
-            bridge,
+            vm_net,
             catalog,
             metrics: Arc::default(),
-            consoles: Arc::default(),
+            sessions: Arc::default(),
         }
     }
 
     pub fn router(&self) -> axum::Router {
         axum::Router::new()
             .merge(node_api::router())
-            .merge(console::router())
+            .merge(sessions::router())
             .merge(user_api::router())
             .merge(nodes_api::router())
             .merge(ops_api::router())
@@ -187,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         None => Cmd::Serve {
             listen: std::env::var("KILN_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.into())
                 .split(',').map(|a| a.trim().parse().context("parsing KILN_LISTEN")).collect::<anyhow::Result<_>>()?,
-            bridge: std::env::var("KILN_BRIDGE").unwrap_or_else(|_| "br0".into()),
+            vm_network: std::env::var("KILN_VM_NETWORK").unwrap_or_else(|_| DEFAULT_VM_NETWORK.into()),
         },
     };
     let role_of = |role: Option<RoleArg>| {
@@ -221,9 +224,10 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Serve { listen, bridge } => {
+        Cmd::Serve { listen, vm_network } => {
             anyhow::ensure!(!listen.is_empty(), "nothing to listen on");
-            let state = AppState::new(conn, bridge, catalog);
+            let vm_net = network::VmNet::parse(&vm_network).context("--vm-network")?;
+            let state = AppState::new(conn, vm_net, catalog);
             let app = state.router();
             tokio::spawn(sweeper::run(state));
             let mut servers = tokio::task::JoinSet::new();

@@ -2,8 +2,6 @@
 //! last desired state received from kiln, and reports what it observes.
 
 mod client;
-#[cfg(not(target_os = "macos"))]
-mod console;
 mod disk;
 #[cfg(not(target_os = "macos"))]
 mod host;
@@ -13,13 +11,16 @@ mod images;
 #[cfg(not(target_os = "macos"))]
 mod libvirt;
 mod reconcile;
+mod sessions;
 mod state;
+mod tailnet;
 #[cfg(any(target_os = "macos", feature = "tart"))]
 mod tart;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
+mod vmnet;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -48,11 +49,6 @@ struct Opts {
     images_dir: Option<PathBuf>,
     #[arg(long, env = "INGOT_LIBVIRT", default_value = "qemu:///system")]
     libvirt: String,
-    /// macOS only: the host interface VMs bridge onto (Tart's --net-bridged).
-    /// On Linux the bridge comes from kiln in each NIC spec.
-    #[arg(long, env = "INGOT_BRIDGE", default_value = "en0")]
-    #[allow(dead_code)]
-    bridge: String,
     /// CPU threads kept back for the host and anything else running on it.
     #[arg(long, env = "INGOT_RESERVE_VCPUS", default_value_t = 2)]
     reserve_vcpus: u32,
@@ -123,8 +119,7 @@ async fn run() -> anyhow::Result<()> {
     // Downloads are only requested by reconciliation, which only runs on a
     // fresh authorized desired state.
     tokio::spawn(images::fetch_loop(kiln.clone(), images, fetches));
-    #[cfg(not(target_os = "macos"))]
-    tokio::spawn(console::console_loop(kiln.clone(), opts.libvirt.clone()));
+    tokio::spawn(sessions::session_loop(kiln.clone(), reconciler.clone(), opts.libvirt.clone()));
     tracing::info!(%fingerprint, "node key; kiln shows the same when you approve");
     let register = RegisterRequest { node_id, hostname, arch, capacity: snapshot_capacity(&reconciler, cached.clone()).await };
     register_until_approved(&kiln, &register).await?;
@@ -145,7 +140,7 @@ fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Nati
 #[cfg(target_os = "macos")]
 fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Native> {
     let _ = &opts.libvirt; // meaningless on macOS; accepted so one env file works everywhere
-    tart::Tart::new(disks, opts.bridge.clone())
+    tart::Tart::new(disks)
 }
 
 fn sha256_hex(secret: &str) -> String {

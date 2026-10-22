@@ -33,7 +33,7 @@ fn registration() -> RegisterRequest {
     RegisterRequest { node_id: NodeId::new_v4(), hostname: "node".into(), arch: Arch::X86_64,
         capacity: Capacity { vcpus: 4, memory_mb: 8192, disk_gb: 100 } }
 }
-fn snapshot() -> DesiredNodeState { DesiredNodeState { generation: 7, instances: vec![] } }
+fn snapshot() -> DesiredNodeState { DesiredNodeState { generation: 7, instances: vec![], network: None } }
 async fn desired(calls: &mut mpsc::UnboundedReceiver<Call>) -> (Option<Generation>, oneshot::Sender<anyhow::Result<DesiredNodeState>>) {
     loop {
         match calls.recv().await.unwrap() {

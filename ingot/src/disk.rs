@@ -89,10 +89,20 @@ impl Disks {
         std::fs::write(&user_data, user_data_yaml(name, spec))?;
         std::fs::write(&meta_data, format!("instance-id: {id}\nlocal-hostname: {}\n", serde_json::to_string(name)?))?;
         let tmp = path.with_extension("iso.tmp");
-        run(Command::new("cloud-localds").arg(&tmp).arg(&user_data).arg(&meta_data))?;
+        let mut localds = Command::new("cloud-localds");
+        // On a copper network the guest gets its fixed address this way.
+        let network = crate::vmnet::network_config(&spec.nics).map(|config| (self.dir.join(format!("{id}-network-config")), config));
+        if let Some((file, config)) = &network {
+            std::fs::write(file, config)?;
+            localds.arg("--network-config").arg(file);
+        }
+        run(localds.arg(&tmp).arg(&user_data).arg(&meta_data))?;
         crate::state::publish_file(&tmp, &path)?;
         let _ = std::fs::remove_file(user_data);
         let _ = std::fs::remove_file(meta_data);
+        if let Some((file, _)) = network {
+            let _ = std::fs::remove_file(file);
+        }
         Ok(path)
     }
 

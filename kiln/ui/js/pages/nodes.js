@@ -3,7 +3,7 @@ import { byRole, nodeNote, role, slab } from '../art.js';
 import { fill, h } from '../dom.js';
 import { gb, percent, plural } from '../format.js';
 import { isAdmin, session } from '../session.js';
-import { act, button, dot, empty, field, fig, input, meter, notice, spark, title } from '../ui.js';
+import { act, button, copyBlock, dot, empty, field, fig, input, meter, notice, spark, st, title } from '../ui.js';
 
 /** Machines as kiln knows them. Admin only: kiln returns 403 to others. */
 export default async function nodes(ctx) {
@@ -79,6 +79,7 @@ function card(n, index, samples, redraw) {
         h('ol', { class: 'facts' }, facts(n).map((f, i) => h('li', {}, h('span', { class: 'mono' }, `${index}.${i + 1}`), f)))),
       n.status === 'pending' ? waiting(n, redraw) : null,
       n.status === 'pending' ? null : held(n),
+      n.status === 'online' ? network(n) : null,
       n.status === 'online' ? overcommit(n, redraw) : null,
       n.status === 'online' ? lives(samples) : null,
       n.status === 'offline' ? retire(n, redraw) : null));
@@ -89,6 +90,22 @@ function facts(n) {
   const vms = n.instances.length ? vmNames(n) : 'no vms';
   if (n.status === 'offline') return [nodeNote(n), n.instances.length ? `${vms} frozen` : vms];
   return [role(n) === 'kiln' ? 'runs kiln' : null, vms].filter(Boolean);
+}
+
+/** The node's copper subnet, whether its host side (copper-net) is in place,
+ *  and whether tailnet devices reach its VMs at their addresses. Nodes that
+ *  don't run copper networks (Tart, for now) don't report any of it. */
+function network(n) {
+  if (!n.subnet || n.network_ready === undefined) return null;
+  return h('div', { class: 'ocbox' },
+    h('div', { class: 'vals' },
+      h('span', { class: 'label' }, 'network'), h('b', {}, n.subnet),
+      n.network_ready ? st('running', 'vms reach the internet') : st('failed', 'vms have no internet'),
+      n.tailnet_route ? st('running', 'on the tailnet') : n.tailnet_route === false ? st('stopped', 'not on the tailnet') : null),
+    n.network_ready ? null : copyBlock("copper-net.service isn't running here", ['$ sudo systemctl start copper-net']),
+    n.tailnet_route === false
+      ? copyBlock('on this node; it replaces any routes it advertises now. then approve it in the tailscale admin console', [`$ sudo tailscale set --advertise-routes=${n.subnet}`])
+      : null);
 }
 
 /** Kiln names them project/name; the current project's go without it. */

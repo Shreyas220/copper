@@ -30,7 +30,7 @@ impl Fixture {
         db::set_node_status(&conn, node, db::NodeDbStatus::Approved).unwrap();
         db::touch_node(&conn, node, &Capacity { vcpus: 1, memory_mb: 1024, disk_gb: 10 }).unwrap();
         let catalog = std::env::temp_dir().join(format!("kiln-test-{}", uuid::Uuid::new_v4()));
-        let state = AppState::new(conn, "br0".into(), catalog);
+        let state = AppState::new(conn, crate::network::VmNet::default(), catalog);
         let app = state.router();
         Self { state, app, admin, user, node, secret }
     }
@@ -91,38 +91,66 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn ssh_tunnel_needs_the_owner_a_running_instance_and_a_lan_address() {
+async fn tunnels_go_through_the_vms_node_and_only_for_its_owner() {
     let f = Fixture::new();
     let (_, vm) = f.create("vm").await;
     let id = vm["id"].as_str().unwrap().to_string();
     let path = "/v1/projects/default/instances/vm/ssh";
     let tunnel = |token: &str, path: &str| {
         Request::builder().uri(path).header("authorization", format!("Bearer {token}"))
-            .header("connection", "upgrade").header("upgrade", user_api::TUNNEL_PROTOCOL).body(Body::empty()).unwrap()
+            .header("connection", "upgrade").header("upgrade", sessions::CLIENT_PROTOCOL).body(Body::empty()).unwrap()
     };
     let status = |req: Request<Body>| async { f.app.clone().oneshot(req).await.unwrap().status() };
     assert_eq!(f.call("GET", path, &f.user, Value::Null).await.0, StatusCode::UPGRADE_REQUIRED);
     assert_eq!(status(tunnel("nope", path)).await, StatusCode::UNAUTHORIZED);
     assert_eq!(status(tunnel(&f.user, path)).await, StatusCode::CONFLICT); // still starting
     assert_eq!(status(tunnel(&f.user, "/v1/projects/admin:default/instances/vm/ssh")).await, StatusCode::FORBIDDEN);
-    // A guest that reports loopback or a tailnet address must not reach the host or the tailnet.
-    let report = json!({"generation_seen":f.generation(),"instances":[{"id":id,"state":"running","addresses":["127.0.0.1","100.75.219.83"]}],
-        "capacity":{"vcpus":1,"memory_mb":1024,"disk_gb":10}});
-    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report).await.0, StatusCode::OK);
-    let resp = f.app.clone().oneshot(tunnel(&f.user, path)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "booting, as far as anyone may know: try again");
+    assert_eq!(f.report_state(&id, "running").await, StatusCode::OK);
+    // Kiln asks the node, which can't reach the VM yet: the caller gets a 503 to retry.
+    let waiting = tokio::spawn(f.app.clone().oneshot(tunnel(&f.user, "/v1/projects/default/instances/vm/ports/8080")));
+    let (_, offers) = f.call("GET", &format!("/nodes/{}/consoles", f.node), &f.secret, Value::Null).await;
+    assert_eq!((offers[0]["instance"].as_str(), offers[0]["port"].as_u64()), (Some(id.as_str()), Some(8080)));
+    let refuse = format!("/nodes/{}/consoles/{}/refuse", f.node, offers[0]["session"].as_str().unwrap());
+    assert_eq!(f.call("POST", &refuse, "nope", json!({"reason": "x"})).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(f.call("POST", &refuse, &f.secret, json!({"reason": "nothing answers on port 8080 yet"})).await.0, StatusCode::NO_CONTENT);
+    let resp = waiting.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-    assert!(body["message"].as_str().unwrap().contains("no LAN address"));
+    assert_eq!(body["message"], "nothing answers on port 8080 yet");
+    assert_eq!(f.call("POST", &refuse, &f.secret, json!({"reason": "again"})).await.0, StatusCode::NOT_FOUND, "answered once");
 }
 
-#[test]
-fn tunnel_targets_are_private_lan_addresses_only() {
-    for ok in ["10.255.255.1", "172.31.255.1", "192.168.254.254", "fd12:3456::1"] {
-        assert!(user_api::relay_allowed(ok.parse().unwrap()), "{ok}");
-    }
-    for bad in ["127.0.0.1", "0.0.0.0", "169.254.1.1", "100.75.219.83", "8.8.8.8", "::1", "fd7a:115c:a1e0::1", "fe80::1"] {
-        assert!(!user_api::relay_allowed(bad.parse().unwrap()), "{bad}");
-    }
+#[tokio::test]
+async fn nodes_get_a_subnet_and_vms_a_fixed_address_in_it() {
+    let f = Fixture::new();
+    f.call("POST", &format!("/v1/nodes/{}/policy", f.node), &f.admin, json!({"cpu_ratio": 4.0, "memory_ratio": 4.0, "disk_ratio": 4.0})).await;
+    // A libvirt node says it runs copper networks by reporting on its host side.
+    let report = |ready: bool, route: bool| json!({"generation_seen": f.generation(), "instances": [], "capacity": {"vcpus":1,"memory_mb":1024,"disk_gb":10},
+        "network_ready": ready, "tailnet_route": route});
+    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(false, false)).await.0, StatusCode::OK);
+    // The fixture's node was approved directly; its first VM gives it a subnet.
+    let (_, a) = f.create("a").await;
+    let (_, b) = f.create("b").await;
+    assert_eq!((a["addresses"].clone(), b["addresses"].clone()), (json!(["10.42.1.10"]), json!(["10.42.1.11"])), "known before boot");
+    let nic = &f.instance_row("a").spec.nics[0];
+    assert_eq!((nic.address.as_deref(), nic.bridge.as_str()), (Some("10.42.1.10/24"), ""));
+    let (_, desired) = f.call("GET", &format!("/nodes/{}/desired", f.node), &f.secret, Value::Null).await;
+    assert_eq!(desired["network"], json!({"subnet": "10.42.1.0/24", "gateway": "10.42.1.1"}));
+    // A node approved later gets the next one; numbers are never reused.
+    let id = NodeId::new_v4();
+    let token = "c".repeat(64);
+    let register = json!({"node_id": id, "hostname": "thinkcentre", "arch": "x86_64", "capacity": {"vcpus": 4, "memory_mb": 8192, "disk_gb": 100}});
+    assert_eq!(f.call("POST", "/nodes/register", &token, register).await.0, StatusCode::OK);
+    let (_, node) = f.call("POST", &format!("/v1/nodes/{id}/approve"), &f.admin, Value::Null).await;
+    assert_eq!(node["subnet"], "10.42.2.0/24");
+    // What the node reports about its network shows on the node, and as
+    // `tailnet` on its VMs once the subnet route is live.
+    assert_eq!(f.call("GET", "/v1/projects/default/instances/a", &f.user, Value::Null).await.1["tailnet"], false);
+    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(true, true)).await.0, StatusCode::OK);
+    let (_, nodes) = f.call("GET", "/v1/nodes", &f.admin, Value::Null).await;
+    let home = nodes.as_array().unwrap().iter().find(|n| n["id"] == json!(f.node)).unwrap();
+    assert_eq!((home["network_ready"].clone(), home["tailnet_route"].clone()), (json!(true), json!(true)));
+    assert_eq!(f.call("GET", "/v1/projects/default/instances/a", &f.user, Value::Null).await.1["tailnet"], true);
 }
 
 #[test]

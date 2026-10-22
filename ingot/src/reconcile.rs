@@ -7,6 +7,7 @@
 //! desired-absent is irreversible and cleanup must eventually complete.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use copper_api::*;
 
 use crate::hv::{DomState, Hypervisor};
 use crate::images::Images;
+use crate::tailnet::RouteCheck;
 
 const FAIL_BUDGET: Duration = Duration::from_secs(5 * 60);
 const RETRY_EVERY: Duration = Duration::from_secs(10);
@@ -49,6 +51,9 @@ pub struct Reconciler<H = crate::hv::Native> {
     /// Size last applied to each VM by this process, so `reconfigure` runs
     /// once per change instead of on every tick.
     configured: HashMap<InstanceId, (u32, u64, u64)>,
+    /// The copper network error last logged, so a lasting one is logged once.
+    network_error: Option<String>,
+    routes: RouteCheck,
 }
 
 impl<H: Hypervisor> Reconciler<H> {
@@ -58,10 +63,12 @@ impl<H: Hypervisor> Reconciler<H> {
             reserve,
             failures: HashMap::new(),
             stop_requested: HashMap::new(),
-            desired: DesiredNodeState { generation: 0, instances: vec![] },
+            desired: DesiredNodeState { generation: 0, instances: vec![], network: None },
             images: None,
             waiting: HashMap::new(),
             configured: HashMap::new(),
+            network_error: None,
+            routes: RouteCheck::default(),
         }
     }
 
@@ -97,6 +104,19 @@ impl<H: Hypervisor> Reconciler<H> {
 
     pub fn reconcile(&mut self, desired: &DesiredNodeState) {
         self.desired = desired.clone();
+        // VMs on the network can't start without it; their own errors say so.
+        if let Some(net) = &desired.network {
+            match self.hv.ensure_network(net) {
+                Ok(()) => self.network_error = None,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if self.network_error.as_ref() != Some(&msg) {
+                        tracing::warn!(subnet = %net.subnet, error = %msg, "copper network isn't up");
+                    }
+                    self.network_error = Some(msg);
+                }
+            }
+        }
         for inst in &desired.instances {
             // A change of desired state wipes the failure history for that instance.
             if self.failures.get(&inst.id).is_some_and(|f| f.desired != inst.state) {
@@ -221,11 +241,39 @@ impl<H: Hypervisor> Reconciler<H> {
                 (Ok(None), _) => (ObservedState::Absent, None),
             };
             let running = state == ObservedState::Running;
-            let addresses = if running { self.hv.addresses(id) } else { vec![] };
+            let addresses = match self.copper_address(inst) {
+                Some(ip) => vec![ip.to_string()],
+                None if running => self.hv.addresses(id),
+                None => vec![],
+            };
             let usage = if running { self.hv.usage(id) } else { None };
             ObservedInstance { id, state, error, addresses, usage }
         }).collect();
-        ObservedNodeState { generation_seen: self.desired.generation, instances, capacity: self.capacity(), usage: self.hv.host_usage() }
+        let tailnet_route = self.desired.network.as_ref().filter(|_| self.hv.copper_network()).and_then(|n| self.routes.live(&n.subnet));
+        ObservedNodeState {
+            generation_seen: self.desired.generation,
+            instances,
+            capacity: self.capacity(),
+            usage: self.hv.host_usage(),
+            network_ready: self.hv.network_ready(),
+            tailnet_route,
+        }
+    }
+
+    /// The address kiln gave the VM, where VMs live on the copper network.
+    fn copper_address(&self, inst: &DesiredInstance) -> Option<std::net::Ipv4Addr> {
+        self.hv.copper_network().then(|| crate::vmnet::address_of(&inst.spec.nics)).flatten()
+    }
+
+    /// Where to connect to reach one of this node's VMs: its copper address,
+    /// or for VMs without one the first address the guest reports that's
+    /// safe to connect to. Nothing for an instance that isn't ours.
+    pub fn reach(&self, id: InstanceId) -> Option<IpAddr> {
+        let inst = self.desired.instances.iter().find(|i| i.id == id)?;
+        if let Some(ip) = self.copper_address(inst) {
+            return Some(ip.into());
+        }
+        self.hv.addresses(id).iter().filter_map(|a| a.parse().ok()).find(|ip| crate::sessions::relay_allowed(*ip))
     }
 }
 
@@ -289,7 +337,7 @@ mod tests {
                 boot_disk: BootDisk { image: "ubuntu".into(), sha256: None, size_gb: 10 },
                 nics: vec![], ssh_keys: vec![],
             },
-        }] }
+        }], network: None }
     }
     #[test]
     fn running_instance_waits_for_its_image_without_spending_the_failure_budget() {

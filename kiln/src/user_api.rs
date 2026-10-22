@@ -22,7 +22,6 @@ pub fn router() -> Router<AppState> {
         .route("/v1/projects/{project}/instances/{name}/start", post(start_instance))
         .route("/v1/projects/{project}/instances/{name}/stop", post(stop_instance))
         .route("/v1/projects/{project}/instances/{name}/resize", post(resize_instance))
-        .route("/v1/projects/{project}/instances/{name}/ssh", get(ssh_tunnel))
         .route("/v1/instances/{id}/forget", post(forget_instance))
 }
 
@@ -89,6 +88,17 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
     let observed = row.observed.as_ref();
     let state = InstanceState::derive(row.desired, observed.map(|o| o.state), node_online);
     let running = state == InstanceState::Running;
+    // On a copper network the address is kiln's to give, and known before
+    // boot. Nodes that run one say so in their reports; elsewhere (Tart, for
+    // now) and for older bridged VMs only the guest's report counts.
+    let on_copper_net = node.as_ref().is_some_and(|n| n.network_ready.is_some());
+    let assigned = row.spec.nics.iter().find_map(|n| n.address.as_deref()).and_then(|a| a.split('/').next())
+        .filter(|_| on_copper_net).map(str::to_string);
+    let tailnet = assigned.is_some() && node.as_ref().is_some_and(|n| n.tailnet_route == Some(true));
+    let addresses = match assigned {
+        Some(a) => vec![a],
+        None => observed.map(|o| o.addresses.clone()).unwrap_or_default(),
+    };
     Ok(Instance {
         id: row.id,
         project: project.path.clone(),
@@ -98,7 +108,7 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
         memory_mb: row.spec.memory_mb,
         arch: row.spec.arch,
         disk_gb: row.spec.boot_disk.size_gb,
-        addresses: observed.map(|o| o.addresses.clone()).unwrap_or_default(),
+        addresses,
         error: observed.and_then(|o| o.error.clone()),
         node: admin.then_some(row.node_id),
         spread: if admin { row.spread } else { None },
@@ -109,6 +119,7 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
         running_since: row.running_since.filter(|_| running),
         usage: metrics.latest(Subject::Instance(row.id)).filter(|_| running),
         ssh_keys: row.spec.ssh_keys.iter().map(|k| instance_key(k)).collect(),
+        tailnet,
     })
 }
 
@@ -144,7 +155,9 @@ async fn get_instance(State(state): State<AppState>, auth: Auth, Path((project, 
 }
 
 /// Validate a create request and turn it into a spec and placement hints.
-fn spec_for(conn: &rusqlite::Connection, state: &AppState, auth: &Auth, req: &CreateInstance) -> Result<InstanceSpec> {
+/// Everything about the VM but its NIC, whose address depends on the node
+/// it lands on.
+fn spec_for(conn: &rusqlite::Connection, auth: &Auth, req: &CreateInstance) -> Result<InstanceSpec> {
     validate_name(&req.name)?;
     if req.vcpus == 0 || req.memory_mb < 128 || req.disk_gb == 0 {
         return Err(Error::bad_request("vcpus, memory_mb and disk_gb must be positive (memory at least 128 MB)"));
@@ -171,7 +184,7 @@ fn spec_for(conn: &rusqlite::Connection, state: &AppState, auth: &Auth, req: &Cr
         memory_mb: req.memory_mb,
         arch: req.arch,
         boot_disk: BootDisk { image: req.image.clone(), sha256, size_gb: req.disk_gb },
-        nics: vec![Nic { bridge: state.bridge.clone(), mac: random_mac() }],
+        nics: vec![],
         ssh_keys: req.ssh_keys.clone(),
     })
 }
@@ -181,7 +194,7 @@ fn spec_for(conn: &rusqlite::Connection, state: &AppState, auth: &Auth, req: &Cr
 async fn check_instance(State(state): State<AppState>, auth: Auth, Path(project): Path<String>, Json(req): Json<CreateInstance>) -> Result<Json<FitCheck>> {
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
-    let spec = spec_for(&conn, &state, &auth, &req)?;
+    let spec = spec_for(&conn, &auth, &req)?;
     let hints = placement::Hints { node: req.node, spread: req.spread.as_deref().map(|g| (p.project.id, g)) };
     Ok(Json(placement::check(&conn, &p.project, &spec, &hints, auth.is_admin())?))
 }
@@ -189,7 +202,7 @@ async fn check_instance(State(state): State<AppState>, auth: Auth, Path(project)
 async fn create_instance(State(state): State<AppState>, auth: Auth, Path(project): Path<String>, Json(req): Json<CreateInstance>) -> Result<(StatusCode, Json<Instance>)> {
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
-    let mut spec = spec_for(&conn, &state, &auth, &req)?;
+    let mut spec = spec_for(&conn, &auth, &req)?;
     if spec.ssh_keys.is_empty() {
         spec.ssh_keys = db::list_keys(&conn, auth.0.id)?.into_iter().map(|k| k.public_key).collect();
     }
@@ -209,6 +222,13 @@ async fn create_instance(State(state): State<AppState>, auth: Auth, Path(project
     }
     let hints = placement::Hints { node: req.node, spread: req.spread.as_deref().map(|g| (p.project.id, g)) };
     let node = placement::choose(&tx, &spec, &hints)?;
+    // A fixed address on the node's copper network, written in at first boot.
+    let n = db::ensure_subnet(&tx, node.id).map_err(|e| Error::conflict(e.to_string()))?;
+    let held = db::list_instances_on_node(&tx, node.id)?;
+    let address = state.vm_net
+        .allocate(n, held.iter().flat_map(|i| i.spec.nics.iter().filter_map(|nic| nic.address.as_deref())))
+        .ok_or_else(|| Error::conflict(format!("{} has no free addresses left", node.hostname)))?;
+    spec.nics = vec![Nic { bridge: String::new(), mac: random_mac(), address: Some(address) }];
     let row = InstanceRow {
         id: InstanceId::new_v4(),
         project_id: p.project.id,
@@ -350,87 +370,6 @@ async fn forget_instance(State(state): State<AppState>, auth: Auth, Path(id): Pa
     state.notify_changed();
     tracing::warn!(instance = %id, node = %row.node_id, "instance forgotten; host resources require manual cleanup");
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ---- ssh -------------------------------------------------------------------
-
-/// HTTP upgrade protocol for `cu ssh`: after `101`, the connection carries
-/// raw bytes to and from the instance's SSH port.
-pub const TUNNEL_PROTOCOL: &str = "copper-tcp";
-const SSH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Relay the caller to their running instance's SSH port, so `cu ssh` works
-/// from anywhere cu reaches kiln, the tailnet included, without routing the
-/// home LAN onto the tailnet. Only the project's owner (or an admin) gets in,
-/// and SSH itself still authenticates the key.
-async fn ssh_tunnel(State(state): State<AppState>, auth: Auth, Path((project, name)): Path<(String, String)>, mut req: axum::extract::Request) -> Result<axum::response::Response> {
-    use axum::http::header::{CONNECTION, UPGRADE};
-    if req.headers().get(UPGRADE).and_then(|v| v.to_str().ok()) != Some(TUNNEL_PROTOCOL) {
-        return Err(Error(StatusCode::UPGRADE_REQUIRED, format!("this endpoint needs Upgrade: {TUNNEL_PROTOCOL}; use cu ssh")));
-    }
-    let (id, candidates) = {
-        let conn = state.db.lock().unwrap();
-        let p = self::project(&conn, &auth, &project)?;
-        let row = db::instance_by_name(&conn, p.project.id, &name)?.ok_or_else(|| Error::not_found("instance"))?;
-        let id = row.id;
-        let inst = to_api(&conn, &state.metrics, row, &p, false)?;
-        if inst.state != InstanceState::Running {
-            let state = serde_json::to_string(&inst.state)?;
-            return Err(Error::conflict(format!("instance is {}, not running", state.trim_matches('"'))));
-        }
-        let candidates: Vec<std::net::IpAddr> = inst.addresses.iter().filter_map(|a| a.parse().ok()).filter(|ip| relay_allowed(*ip)).collect();
-        (id, candidates)
-    };
-    // 503 and 502 both mean "booting, try again"; cu's tunnel retries them.
-    if candidates.is_empty() {
-        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "instance has no LAN address yet; try again once it has booted".into()));
-    }
-    // A guest can report several addresses (docker bridges, say); take the
-    // first that answers on port 22.
-    let mut stream = None;
-    for ip in &candidates {
-        let target = std::net::SocketAddr::new(*ip, 22);
-        if let Ok(Ok(s)) = tokio::time::timeout(SSH_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
-            stream = Some((s, target));
-            break;
-        }
-    }
-    let Some((mut stream, target)) = stream else {
-        return Err(Error(StatusCode::BAD_GATEWAY, "the instance's SSH port does not answer yet".into()));
-    };
-    let on_upgrade = hyper::upgrade::on(&mut req);
-    let user = auth.0.name.clone();
-    tracing::info!(%user, instance = %id, %target, "ssh tunnel opened");
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let mut client = hyper_util::rt::TokioIo::new(upgraded);
-                let result = tokio::io::copy_bidirectional(&mut client, &mut stream).await;
-                tracing::info!(%user, instance = %id, ?result, "ssh tunnel closed");
-            }
-            Err(e) => tracing::warn!(%user, instance = %id, error = %e, "ssh tunnel upgrade failed"),
-        }
-    });
-    axum::response::Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(CONNECTION, "upgrade")
-        .header(UPGRADE, TUNNEL_PROTOCOL)
-        .body(axum::body::Body::empty())
-        .map_err(|e| Error::from(anyhow::Error::from(e)))
-}
-
-/// Guest agents report addresses, so they are untrusted. Relay only to
-/// private LAN addresses that aren't this host's own: nothing a bridged
-/// guest couldn't reach by itself. Loopback, the tailnet and link-local
-/// addresses are never targets.
-pub fn relay_allowed(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    let private = match ip {
-        IpAddr::V4(v4) => v4.is_private(),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 && !crate::trusted_network(ip),
-    };
-    // Binding succeeds only for an address assigned to this host.
-    private && std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).is_err()
 }
 
 // ---- helpers ---------------------------------------------------------------

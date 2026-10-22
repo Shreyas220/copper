@@ -105,6 +105,17 @@ enum Cmd {
     /// Relay stdin and stdout to an instance's SSH port (ssh's ProxyCommand)
     #[command(hide = true)]
     Tunnel { name: String },
+    /// Reach a TCP port on an instance from this machine, e.g. a web server
+    /// or a game: connections to localhost go to the port on the VM, through
+    /// kiln and its node, from anywhere cu works
+    Forward {
+        name: String,
+        port: u16,
+        /// Local port to listen on. Defaults to the same port, or 10000 more
+        /// for ports below 1024, which need root to listen on.
+        #[arg(long)]
+        local: Option<u16>,
+    },
     /// Base images in kiln's catalogue
     #[command(subcommand)]
     Image(ImageCmd),
@@ -275,16 +286,16 @@ async fn check_keys(c: &Client, i: &Instance) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Upgrade an HTTP request to kiln into a byte stream to the instance's SSH
-/// port, then shuttle stdin and stdout across it. While the VM is still
-/// booting (no address yet, or sshd not listening) it retries for a minute.
-async fn tunnel(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
+/// A byte stream to one of an instance's TCP ports, through kiln and the
+/// instance's node. While the VM is still booting (no address yet, nothing
+/// listening) kiln answers 503, and this retries for a minute.
+async fn open_tunnel(c: &Client, project: &str, name: &str, port: u16) -> anyhow::Result<reqwest::Upgraded> {
+    let path = if port == 22 { "ssh".to_string() } else { format!("ports/{port}") };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = false;
     let resp = loop {
         let resp = c.http
-            .get(format!("{}/v1/projects/{project}/instances/{name}/ssh", c.url))
+            .get(format!("{}/v1/projects/{project}/instances/{name}/{path}", c.url))
             .bearer_auth(&c.token)
             .header(reqwest::header::CONNECTION, "upgrade")
             .header(reqwest::header::UPGRADE, "copper-tcp")
@@ -302,12 +313,36 @@ async fn tunnel(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
             bail!("{status}: {msg}");
         }
         if !said {
-            eprintln!("cu: waiting for ssh on {name}…");
+            eprintln!("cu: waiting for port {port} on {name}…");
             said = true;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };
-    let (mut from_vm, mut to_vm) = tokio::io::split(resp.upgrade().await.context("opening the tunnel")?);
+    resp.upgrade().await.context("opening the tunnel")
+}
+
+/// Accept connections on `local` and carry each to `port` on the instance.
+async fn forward(c: &Client, project: &str, name: &str, port: u16, local: u16) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", local)).await.with_context(|| format!("listening on localhost:{local}"))?;
+    println!("localhost:{local} → {name}:{port}; ctrl-c to stop");
+    loop {
+        let (mut conn, _) = listener.accept().await?;
+        let (c, project, name) = (c.clone(), project.to_string(), name.to_string());
+        tokio::spawn(async move {
+            match open_tunnel(&c, &project, &name, port).await {
+                Ok(mut vm) => {
+                    let _ = tokio::io::copy_bidirectional(&mut conn, &mut vm).await;
+                }
+                Err(e) => eprintln!("cu: {e:#}"),
+            }
+        });
+    }
+}
+
+/// ssh's ProxyCommand: stdin and stdout to the instance's SSH port.
+async fn tunnel(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let (mut from_vm, mut to_vm) = tokio::io::split(open_tunnel(c, project, name, 22).await?);
     tokio::spawn(async move {
         let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut to_vm).await;
         let _ = to_vm.shutdown().await;
@@ -335,6 +370,7 @@ fn print_node(n: &Node) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct Client {
     http: reqwest::Client,
     url: String,
@@ -501,6 +537,11 @@ async fn main() -> anyhow::Result<()> {
             }
             // stdin is read on a blocking thread that would hold the runtime open.
             std::process::exit(0);
+        }
+        Cmd::Forward { name, port, local } => {
+            reachable_instance(&c, p, &name).await?;
+            let local = local.unwrap_or(if port < 1024 { port.saturating_add(10000) } else { port });
+            forward(&c, p, &name, port, local).await?;
         }
         Cmd::Image(ImageCmd::Ls) => {
             let v: Vec<Image> = c.call(Method::GET, "/v1/images", None).await?;

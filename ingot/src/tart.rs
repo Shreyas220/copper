@@ -30,25 +30,25 @@ use copper_api::*;
 use crate::disk::{run, user_data_yaml, Disks};
 use crate::hv::{name_of, DomState, Hypervisor};
 
+/// VMs run on Tart's own NAT: Tart assigns their MAC and address (read back
+/// through `tart ip`), and ingot reaches them from the Mac. The address kiln
+/// gives on the node's copper /24 waits until the Mac's vmnet subnet is set
+/// to it.
 pub struct Tart {
     disks: Disks,
-    /// Host interface to bridge onto, e.g. `en0`. Kiln's per-NIC bridge name
-    /// is Linux-specific and ignored here. The MAC kiln chose is ignored too:
-    /// Tart assigns its own, and addresses are read back through `tart ip`.
-    bridge: String,
     home: PathBuf,
     uid: u32,
 }
 
 impl Tart {
-    pub fn new(disks: Disks, bridge: String) -> anyhow::Result<Self> {
+    pub fn new(disks: Disks) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?;
         let uid = unsafe { libc::getuid() };
         if Command::new("tart").arg("--version").output().is_err() {
             bail!("tart not found; brew install cirruslabs/cli/tart");
         }
         std::fs::create_dir_all(&disks.dir)?;
-        Ok(Self { disks, bridge, home, uid })
+        Ok(Self { disks, home, uid })
     }
 
     fn vm_dir(&self, id: InstanceId) -> PathBuf {
@@ -110,7 +110,6 @@ impl Tart {
         let args = [
             "tart", "run", &name_of(id), "--no-graphics",
             "--disk", &format!("{}:ro", seed.display()),
-            "--net-bridged", &self.bridge,
         ];
         let strings: String = args.iter().map(|a| format!("    <string>{}</string>\n", xml_escape(a))).collect();
         format!(
@@ -294,10 +293,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plist_runs_tart_with_seed_and_bridge() {
+    fn plist_runs_tart_with_seed_on_its_own_nat() {
         let t = Tart {
             disks: Disks { dir: "/tmp/copper".into(), images: "/tmp/copper/images".into() },
-            bridge: "en0".into(),
             home: "/Users/copper".into(),
             uid: 501,
         };
@@ -306,7 +304,7 @@ mod tests {
         assert!(p.contains("<string>com.copper.vm.00000000-0000-0000-0000-000000000000</string>"));
         assert!(p.contains("<string>copper-00000000-0000-0000-0000-000000000000</string>"));
         assert!(p.contains("<string>/tmp/copper/00000000-0000-0000-0000-000000000000-seed.iso:ro</string>"));
-        assert!(p.contains("<string>--net-bridged</string>\n    <string>en0</string>"));
+        assert!(!p.contains("--net-bridged"), "not on the site's LAN");
         assert_eq!(t.plist_path(id), PathBuf::from("/Users/copper/Library/LaunchAgents/com.copper.vm.00000000-0000-0000-0000-000000000000.plist"));
     }
 }

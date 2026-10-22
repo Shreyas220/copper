@@ -10,9 +10,11 @@ use anyhow::{anyhow, Context};
 use copper_api::*;
 use virt::connect::Connect;
 use virt::domain::Domain;
+use virt::network::Network;
 use virt::sys;
 
 use crate::disk::Disks;
+use crate::vmnet;
 use crate::host::HostUsage;
 use crate::hv::{name_of, DomState, Hypervisor};
 
@@ -168,6 +170,28 @@ impl Libvirt {
         Ok(())
     }
 
+    /// The node's copper network, defined, running and set to start at boot.
+    pub fn ensure_network(&self, net: &NodeNetwork) -> anyhow::Result<()> {
+        let name = vmnet::libvirt_name(&net.subnet);
+        let network = match Network::lookup_by_name(&self.conn, &name) {
+            Ok(n) => n,
+            Err(e) if e.code() == virt::error::ErrorNumber::NoNetwork => {
+                let n = Network::define_xml(&self.conn, &network_xml(net)?).map_err(err).context("defining the copper network")?;
+                tracing::info!(network = %name, subnet = %net.subnet, "copper network defined");
+                n
+            }
+            Err(e) => return Err(err(e)),
+        };
+        if !network.is_active().map_err(err)? {
+            network.create().map_err(err).context("starting the copper network")?;
+            tracing::info!(network = %name, "copper network started");
+        }
+        if !network.get_autostart().map_err(err)? {
+            network.set_autostart(true).map_err(err)?;
+        }
+        Ok(())
+    }
+
     /// IPv4 addresses of the domain's NICs. The guest agent is authoritative
     /// once cloud-init has installed it; until then the host ARP table is the
     /// fallback, which only knows a guest the host has exchanged traffic with
@@ -202,16 +226,7 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
         Arch::X86_64 => "q35",
         Arch::Aarch64 => "virt",
     };
-    let nics: String = spec
-        .nics
-        .iter()
-        .map(|n| {
-            format!(
-                "    <interface type='bridge'>\n      <source bridge='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n    </interface>\n",
-                xml_escape(&n.bridge), xml_escape(&n.mac)
-            )
-        })
-        .collect();
+    let nics: String = spec.nics.iter().map(nic_xml).collect();
     format!(
         r#"<domain type='kvm'>
   <name>{name}</name>
@@ -261,6 +276,32 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
     )
 }
 
+/// On the node's copper network, with libvirt's own clean-traffic filter so a
+/// VM can only send as its own MAC and address. Older VMs stay on their bridge.
+fn nic_xml(n: &Nic) -> String {
+    match n.address.as_deref().and_then(vmnet::parse) {
+        Some((ip, net)) => format!(
+            "    <interface type='network'>\n      <source network='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n      \
+             <filterref filter='clean-traffic'>\n        <parameter name='IP' value='{ip}'/>\n      </filterref>\n    </interface>\n",
+            xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&n.mac)
+        ),
+        None => format!(
+            "    <interface type='bridge'>\n      <source bridge='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n    </interface>\n",
+            xml_escape(&n.bridge), xml_escape(&n.mac)
+        ),
+    }
+}
+
+/// `open` mode: libvirt runs DNS on the gateway and adds no firewall rules.
+/// copper-net.service owns those.
+fn network_xml(net: &NodeNetwork) -> anyhow::Result<String> {
+    let bridge = vmnet::bridge_name(net).ok_or_else(|| anyhow!("bad subnet {}", net.subnet))?;
+    Ok(format!(
+        "<network>\n  <name>{}</name>\n  <forward mode='open'/>\n  <bridge name='{}' stp='off' delay='0'/>\n  <ip address='{}' netmask='255.255.255.0'/>\n</network>\n",
+        xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&bridge), xml_escape(&net.gateway)
+    ))
+}
+
 fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
         .replace('\"', "&quot;").replace('\'', "&apos;")
@@ -286,6 +327,38 @@ impl Hypervisor for Libvirt {
     fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()> { self.reconfigure(inst) }
     fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>> { self.state(id) }
     fn addresses(&self, id: InstanceId) -> Vec<String> { self.addresses(id) }
+    fn copper_network(&self) -> bool { true }
+    fn ensure_network(&self, net: &NodeNetwork) -> anyhow::Result<()> { self.ensure_network(net) }
+    fn network_ready(&self) -> Option<bool> { Some(Path::new(vmnet::READY_FILE).exists()) }
     fn usage(&self, id: InstanceId) -> Option<Usage> { self.usage(id) }
     fn host_usage(&self) -> Option<Usage> { self.host.read() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nic(address: Option<&str>, bridge: &str) -> Nic {
+        Nic { bridge: bridge.into(), mac: "52:54:00:12:34:56".into(), address: address.map(str::to_string) }
+    }
+
+    #[test]
+    fn vms_join_their_nodes_copper_network_and_only_as_themselves() {
+        let x = nic_xml(&nic(Some("10.42.1.10/24"), ""));
+        assert!(x.contains("<interface type='network'>"));
+        assert!(x.contains("<source network='copper-10.42.1.0-24'/>"));
+        assert!(x.contains("<filterref filter='clean-traffic'>"));
+        assert!(x.contains("<parameter name='IP' value='10.42.1.10'/>"));
+        let older = nic_xml(&nic(None, "br0"));
+        assert!(older.contains("<source bridge='br0'/>") && !older.contains("filterref"), "bridged VMs stay as they were");
+    }
+
+    #[test]
+    fn the_network_adds_no_firewall_rules_of_its_own() {
+        let x = network_xml(&NodeNetwork { subnet: "10.42.1.0/24".into(), gateway: "10.42.1.1".into() }).unwrap();
+        assert!(x.contains("<name>copper-10.42.1.0-24</name>"));
+        assert!(x.contains("<forward mode='open'/>"));
+        assert!(x.contains("<bridge name='cu-42-1'"));
+        assert!(x.contains("<ip address='10.42.1.1' netmask='255.255.255.0'/>"));
+    }
 }

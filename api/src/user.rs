@@ -80,6 +80,10 @@ pub struct Instance {
     /// log in, and only recreating it changes that.
     #[serde(default)]
     pub ssh_keys: Vec<InstanceKey>,
+    /// Tailnet devices can reach its address directly: it's on a copper
+    /// network whose node advertises the subnet route.
+    #[serde(default)]
+    pub tailnet: bool,
 }
 
 /// A key a VM was made with: enough to recognise it, not the key itself.
@@ -192,6 +196,14 @@ pub struct Node {
     pub instances: Vec<String>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Its copper subnet, `10.42.1.0/24`, once approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
+    /// As the node last reported; see `ObservedNodeState`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_route: Option<bool>,
 }
 
 /// A base image in kiln's catalogue.

@@ -16,7 +16,7 @@ See `docs/design.md` for the decisions so far and `docs/roadmap.md` for what com
 
 ## Install
 
-One machine runs kiln. Name it `kiln` on your tailnet so every node finds it by default. The installer also adds Ubuntu 24.04 to kiln's image catalogue, which nodes download from by hash. Add `--lan` to serve the home network too, over plain HTTP.
+One machine runs kiln. Name it `kiln` on your tailnet so every node finds it by default. The installer also adds Ubuntu 24.04 to kiln's image catalogue, which nodes download from by hash. The tailnet is copper's network: kiln listens on it, nodes and people reach kiln over it, and VMs live on copper's own `10.42.0.0/16`, a /24 per node, rather than on any site's LAN. That works the same whether a node sits on your home router or anywhere else.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shreyas220/copper/main/install.sh | sudo sh -s -- kiln
@@ -50,7 +50,8 @@ cu project create default
 cu key add                         # save ~/.ssh/id_ed25519.pub, or `cu key new` to make a key
 cu create web --vcpus 2 --memory 2048
 cu ls
-cu ssh web                         # through kiln, so it works over the tailnet too
+cu ssh web                         # through kiln and the VM's node, from anywhere
+cu forward web 8080                # its port 8080 at localhost:8080
 cu ssh-config web >> ~/.ssh/config # then: scp file web.copper:
 cu stop web --wait && cu resize web --memory 4096 --disk 20 && cu start web
 cu log web                         # what happened to it, newest first

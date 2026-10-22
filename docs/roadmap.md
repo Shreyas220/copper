@@ -6,11 +6,23 @@ Goals for copper, in the order they make sense to build. [design.md](design.md) 
 
 - [ ] Test and fix the Tart backend on the mini. Waiting for the hardware. CI now compiles it and runs the unit tests on macOS; it has never driven a real Tart VM. Then take the preview tag off the landing page.
 - [x] A launchd-aware macOS section in the docs.
-- [ ] Install on the laptop for real with the systemd units, so kiln and ingot stop being dev processes. Needs the owner's sudo; the installer is ready.
-- [x] LAN binding for kiln: several listen addresses and `install.sh kiln --lan`, with a warning for plain HTTP outside loopback and the tailnet. TLS itself is still to do.
+- [x] Install on the laptop for real with the systemd units, so kiln and ingot stop being dev processes.
+- [x] LAN binding for kiln: several listen addresses and `install.sh kiln --lan`, with a warning for plain HTTP outside loopback and the tailnet. Kept for odd setups; copper itself now runs on the tailnet.
 - [x] Images fetched from kiln by hash. Kiln holds the catalogue, nodes download and verify once.
 - [x] macOS installer parity: kiln, ingot and cu for Apple silicon in the release, and `prepare.sh --update` to update in place.
 - [x] SSH into your own VMs from anywhere: `cu ssh` and `cu ssh-config`, tunnelled through kiln.
+- [x] SSH keys saved in kiln, made in the browser or with `cu key new`, and a fix for VMs made without one.
+
+## Networking
+
+One architecture wherever a node is: on the home router or anywhere on the tailnet.
+
+- [x] Copper networks: `10.42.0.0/16`, a /24 per node, a fixed address per VM written in by cloud-init.
+- [x] `copper-net.service`: NAT to the internet, nothing private, nothing on the node but DNS. Tested in network namespaces in CI.
+- [x] Reach VMs through their node: `cu ssh`, `cu forward <vm> <port>` and the serial console, with kiln never connecting to a node or a VM.
+- [x] Kiln on the tailnet and loopback only.
+- [ ] Each node advertises its /24 as a Tailscale subnet route, so tailnet devices reach VMs at their addresses and VMs reach each other across nodes. The owner's switch to flip; the Nodes page shows the command until it's live.
+- [ ] Tart nodes on copper networks: set the Mac's vmnet subnet to the node's /24. Waits for the Mac mini.
 
 ## Scheduling and capacity
 
@@ -30,7 +42,7 @@ Goals for copper, in the order they make sense to build. [design.md](design.md) 
 
 ## Later
 
-- TLS for kiln, so LAN binding doesn't expose tokens or passwords.
+- TLS for kiln, for anyone binding it outside the tailnet.
 - Serial consoles on Tart nodes.
 - Containers: a `kind` field and a podman backend.
 - GPU passthrough of the whole card to one VM.

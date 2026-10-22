@@ -77,8 +77,33 @@ pub fn valid_sha256(hash: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nic {
+    /// VMs made before copper networks were bridged onto this host bridge,
+    /// with addresses from the site's router. Empty for new VMs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bridge: String,
     pub mac: String,
+    /// The VM's fixed address on its node's copper network, e.g.
+    /// `10.42.1.10/24`. Set for every VM made since copper networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// A node's part of copper's network: the /24 its VMs live in. The node is
+/// the gateway, and the gateway is also the VMs' DNS server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeNetwork {
+    /// `10.42.1.0/24`
+    pub subnet: String,
+    /// `10.42.1.1`
+    pub gateway: String,
+}
+
+impl NodeNetwork {
+    /// The second and third octets, for short names: `cu-42-1`.
+    pub fn octets(&self) -> Option<(u8, u8)> {
+        let mut it = self.subnet.split('/').next()?.split('.').skip(1).map(|o| o.parse::<u8>().ok());
+        Some((it.next()??, it.next()??))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +133,9 @@ pub struct DesiredInstance {
 pub struct DesiredNodeState {
     pub generation: Generation,
     pub instances: Vec<DesiredInstance>,
+    /// The node's copper network. `None` only before kiln has assigned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NodeNetwork>,
 }
 
 // ---- observed state -------------------------------------------------------
@@ -146,6 +174,15 @@ pub struct ObservedNodeState {
     /// Live resource use of the whole host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Whether the host side of the copper network (`copper-net.service`)
+    /// is in place. Without it VMs have no internet. `None` on platforms
+    /// that don't need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_ready: Option<bool>,
+    /// Whether the node's subnet is live as a Tailscale subnet route, so
+    /// tailnet devices reach its VMs directly. `None` without Tailscale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_route: Option<bool>,
 }
 
 /// A point-in-time reading. CPU is in tenths of a percent of what the thing
@@ -161,12 +198,21 @@ pub struct Usage {
 
 // ---- serial consoles ----------------------------------------------------------
 
-/// Someone wants a VM's serial console. The node dials back to kiln to carry
-/// it, so kiln still never connects to a node.
+/// Someone wants to reach a VM: its serial console, or with `port` a TCP
+/// port on it (22 for `cu ssh`). The node dials back to kiln to carry it,
+/// so kiln never connects to a node or a VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleRequest {
     pub session: Uuid,
     pub instance: InstanceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// Why a node couldn't carry a session, such as the VM not answering yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRefused {
+    pub reason: String,
 }
 
 /// Short, human-comparable form of a node credential: the first 16 hex

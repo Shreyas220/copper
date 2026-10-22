@@ -54,6 +54,21 @@ pub trait Hypervisor {
     fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>>;
     fn addresses(&self, id: InstanceId) -> Vec<String>;
 
+    /// Whether VMs here live on the node's copper network, at the addresses
+    /// kiln gives them. Tart keeps its own NAT for now.
+    fn copper_network(&self) -> bool {
+        false
+    }
+    /// Set up the node's copper network if it isn't. Idempotent.
+    fn ensure_network(&self, _net: &NodeNetwork) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Whether the host side of the copper network is in place, when the
+    /// platform has one.
+    fn network_ready(&self) -> Option<bool> {
+        None
+    }
+
     /// Live use of one running VM, when the platform can measure it.
     fn usage(&self, _id: InstanceId) -> Option<Usage> {
         None

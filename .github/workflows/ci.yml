@@ -13,7 +13,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --workspace
       - run: cargo check --locked -p ingot --features tart
-      - run: sh -n install.sh && sh -n dist/macos/prepare.sh
+      - run: sh -n install.sh && sh -n dist/macos/prepare.sh && sh -n dist/systemd/copper-net && sh -n tests/copper-net.sh
+      # copper-net's firewall rules, in throwaway network namespaces.
+      - run: sudo apt-get install -y nftables && sudo sh tests/copper-net.sh
 
   # The Tart backend only compiles for real here. GitHub's Apple silicon
   # runners can't nest virtualization, so it still isn't run against Tart.

@@ -128,6 +128,17 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (user_id, fingerprint)
     );
     "#,
+    // v6: copper networks. A node's subnet is N in 10.42.N.0/24, given when
+    // it's approved and never reused; nodes approved before now are
+    // numbered in the order they joined.
+    r#"
+    ALTER TABLE nodes ADD COLUMN subnet INTEGER;
+    ALTER TABLE nodes ADD COLUMN network_ready INTEGER;
+    ALTER TABLE nodes ADD COLUMN tailnet_route INTEGER;
+    UPDATE nodes SET subnet = (SELECT COUNT(*) FROM nodes AS n WHERE n.status != 'pending' AND n.rowid <= nodes.rowid)
+        WHERE status != 'pending';
+    CREATE UNIQUE INDEX nodes_by_subnet ON nodes(subnet);
+    "#,
 ];
 
 mod events;
@@ -318,6 +329,11 @@ pub struct NodeRow {
     pub overcommit: Overcommit,
     /// The sweeper logged that this node stopped reporting.
     pub quiet: bool,
+    /// N in its copper subnet, `10.42.N.0/24`. `None` until approved.
+    pub subnet: Option<u8>,
+    /// As the node last reported them; see `ObservedNodeState`.
+    pub network_ready: Option<bool>,
+    pub tailnet_route: Option<bool>,
 }
 
 impl NodeRow {
@@ -333,8 +349,11 @@ impl NodeRow {
             NodeDbStatus::Approved => NodeStatus::Offline,
         }
     }
-    pub fn to_api(&self, allocated: Capacity, instances: Vec<String>, usage: Option<Usage>) -> Node {
+    pub fn to_api(&self, allocated: Capacity, instances: Vec<String>, usage: Option<Usage>, subnet: Option<String>) -> Node {
         Node {
+            subnet,
+            network_ready: self.network_ready,
+            tailnet_route: self.tailnet_route,
             id: self.id,
             hostname: self.hostname.clone(),
             arch: self.arch,
@@ -364,10 +383,34 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
         token_hash: r.get(7)?,
         overcommit: Overcommit { cpu: r.get(8)?, memory: r.get(9)?, disk: r.get(10)? },
         quiet: r.get(11)?,
+        subnet: r.get(12)?,
+        network_ready: r.get(13)?,
+        tailnet_route: r.get(14)?,
     })
 }
 
-const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio, quiet";
+const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio, quiet, \
+                         subnet, network_ready, tailnet_route";
+
+/// The node's subnet number, giving it the next one if it has none yet.
+/// Numbers are never reused, so a retired node's addresses never come back.
+pub fn ensure_subnet(conn: &Connection, id: NodeId) -> anyhow::Result<u8> {
+    if let Some(n) = node(conn, id)?.and_then(|n| n.subnet) {
+        return Ok(n);
+    }
+    let next: i64 = conn.query_row("SELECT COALESCE(MAX(subnet), 0) + 1 FROM nodes", [], |r| r.get(0))?;
+    anyhow::ensure!(next <= 254, "copper's network has room for 254 nodes, and all have been used");
+    conn.execute("UPDATE nodes SET subnet = ?1 WHERE id = ?2", params![next, id.to_string()])?;
+    Ok(next as u8)
+}
+
+pub fn set_network_reports(conn: &Connection, id: NodeId, network_ready: Option<bool>, tailnet_route: Option<bool>) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE nodes SET network_ready = ?1, tailnet_route = ?2 WHERE id = ?3",
+        params![network_ready, tailnet_route, id.to_string()],
+    )?;
+    Ok(())
+}
 
 pub fn set_quiet(conn: &Connection, id: NodeId, quiet: bool) -> rusqlite::Result<()> {
     conn.execute("UPDATE nodes SET quiet = ?1 WHERE id = ?2", params![quiet, id.to_string()])?;

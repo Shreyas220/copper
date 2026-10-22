@@ -28,7 +28,8 @@ pub fn node_api(conn: &rusqlite::Connection, state: &AppState, node: &db::NodeRo
         names.push(format!("{project}/{}", inst.name));
     }
     let usage = state.metrics.latest(Subject::Node(node.id)).filter(|_| node.online());
-    Ok(node.to_api(placement::allocated(instances.iter()), names, usage))
+    let subnet = node.subnet.map(|n| state.vm_net.node(n).subnet);
+    Ok(node.to_api(placement::allocated(instances.iter()), names, usage, subnet))
 }
 
 async fn list_nodes(State(state): State<AppState>, auth: Auth) -> Result<Json<Vec<Node>>> {
@@ -69,7 +70,8 @@ async fn approve_node(State(state): State<AppState>, auth: Auth, Path(id): Path<
         return Err(Error::conflict("node must register its credential before approval"));
     }
     db::set_node_status(&conn, id, NodeDbStatus::Approved)?;
-    db::record(&conn, NewEvent::new("node approved", format!("{} can take work", node.hostname)).node(id).by(&auth.0.name))?;
+    let subnet = state.vm_net.node(db::ensure_subnet(&conn, id).map_err(|e| Error::conflict(e.to_string()))?).subnet;
+    db::record(&conn, NewEvent::new("node approved", format!("{} can take work · its vms get {subnet}", node.hostname)).node(id).by(&auth.0.name))?;
     state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node approved");
     node_api(&conn, &state, &db::node(&conn, id)?.unwrap()).map(Json)

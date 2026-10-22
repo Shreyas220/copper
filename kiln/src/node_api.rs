@@ -104,7 +104,8 @@ fn read_desired(state: &AppState, id: NodeId, headers: &HeaderMap) -> Result<Des
         .into_iter()
         .map(|r| DesiredInstance { id: r.id, name: r.name, state: r.desired, spec: r.spec })
         .collect();
-    Ok(DesiredNodeState { generation: node.generation, instances })
+    let network = node.subnet.map(|n| state.vm_net.node(n));
+    Ok(DesiredNodeState { generation: node.generation, instances, network })
 }
 
 async fn desired(
@@ -149,6 +150,9 @@ async fn observed(
     }
     if let Some(usage) = report.usage {
         state.metrics.record(Subject::Node(id), now, usage);
+    }
+    if (report.network_ready, report.tailnet_route) != (node.network_ready, node.tailnet_route) {
+        db::set_network_reports(&tx, id, report.network_ready, report.tailnet_route)?;
     }
     for obs in &report.instances {
         let Some(row) = db::instance(&tx, obs.id)? else { continue };

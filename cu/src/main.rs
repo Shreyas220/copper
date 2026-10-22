@@ -53,8 +53,24 @@ enum Cmd {
         #[arg(long)]
         spread: Option<String>,
     },
-    Start { name: String },
-    Stop { name: String },
+    Start {
+        name: String,
+        /// Return once it's running (or failed).
+        #[arg(long)]
+        wait: bool,
+    },
+    Stop {
+        name: String,
+        /// Return once it's stopped. Needed before `cu resize`.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// What happened lately, newest first: the whole project, or one instance
+    Log {
+        name: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: u32,
+    },
     /// Resize a stopped instance. Disks only grow.
     Resize {
         name: String,
@@ -140,6 +156,35 @@ fn proxy_command(url: &str, project: &str, name: &str) -> anyhow::Result<String>
         "{} --url {} --project {} tunnel {}",
         proxy_quote(&exe.to_string_lossy()), proxy_quote(url), proxy_quote(project), proxy_quote(name)
     ))
+}
+
+/// Poll until the instance reaches `target`. A failure ends the wait early
+/// with the node's error.
+async fn wait_for(c: &Client, project: &str, name: &str, target: InstanceState) -> anyhow::Result<Instance> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let i: Instance = c.call(Method::GET, &format!("/v1/projects/{project}/instances/{name}"), None).await?;
+        if i.state == target {
+            return Ok(i);
+        }
+        if i.state == InstanceState::Failed {
+            bail!("{name} failed: {}", i.error.unwrap_or_default());
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("{name} is still {} after 5 minutes", serde_json::to_string(&i.state)?.trim_matches('"'));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// `40s`, `12m`, `3h`, `2d`.
+fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
 }
 
 async fn running_instance(c: &Client, project: &str, name: &str) -> anyhow::Result<Instance> {
@@ -352,13 +397,31 @@ async fn main() -> anyhow::Result<()> {
                 println!("{:<24} {:<8} {}  {} MB", i.name, serde_json::to_string(&i.arch)?.trim_matches('"'), &i.sha256[..12], i.size_bytes / (1024 * 1024));
             }
         }
-        Cmd::Start { name } => {
-            let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/start"), None).await?;
+        Cmd::Start { name, wait } => {
+            let mut i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/start"), None).await?;
+            if wait {
+                i = wait_for(&c, p, &name, InstanceState::Running).await?;
+            }
             print_instance(&i);
         }
-        Cmd::Stop { name } => {
-            let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/stop"), None).await?;
+        Cmd::Stop { name, wait } => {
+            let mut i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances/{name}/stop"), None).await?;
+            if wait {
+                i = wait_for(&c, p, &name, InstanceState::Stopped).await?;
+            }
             print_instance(&i);
+        }
+        Cmd::Log { name, limit } => {
+            let mut path = format!("/v1/events?project={p}&limit={limit}");
+            if let Some(name) = &name {
+                path.push_str(&format!("&instance={name}"));
+            }
+            let events: Vec<Event> = c.call(Method::GET, &path, None).await?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+            for e in events {
+                let who = e.actor.map(|a| format!("  ({a})")).unwrap_or_default();
+                println!("{:>8}  {:<14} {:<20} {}{who}", ago(now - e.at), e.kind, e.instance.unwrap_or_default(), e.detail);
+            }
         }
         Cmd::Rm { name } => {
             let _: () = c.call(Method::DELETE, &format!("/v1/projects/{p}/instances/{name}"), None).await?;

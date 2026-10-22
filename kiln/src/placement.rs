@@ -89,3 +89,71 @@ fn free<'a>(node: &NodeRow, instances: impl Iterator<Item = &'a InstanceRow>) ->
 fn fits(free: &Capacity, spec: &InstanceSpec) -> bool {
     free.vcpus >= spec.vcpus && free.memory_mb >= spec.memory_mb && free.disk_gb >= spec.boot_disk.size_gb
 }
+
+fn size_of(spec: &InstanceSpec) -> Capacity {
+    Capacity { vcpus: spec.vcpus, memory_mb: spec.memory_mb, disk_gb: spec.boot_disk.size_gb }
+}
+
+// ---- quotas ------------------------------------------------------------------
+
+/// What a project's instances hold, stopped and deleting ones included.
+pub fn project_usage(conn: &Connection, project: db::Uuid) -> Result<Capacity> {
+    Ok(allocated(db::list_instances_in_project(conn, project)?.iter()))
+}
+
+/// Why `extra` more would break the project's caps, if it would. `release`
+/// is what an instance being resized already holds.
+pub fn quota_refusal(conn: &Connection, project: &db::Project, spec: &InstanceSpec, release: Option<InstanceId>) -> Result<Option<String>> {
+    let instances = db::list_instances_in_project(conn, project.id)?;
+    let used = allocated(instances.iter().filter(|i| Some(i.id) != release));
+    let want = size_of(spec);
+    let caps = &project.quota;
+    let over = |cap: Option<u64>, used: u64, want: u64, what: &str| {
+        cap.filter(|cap| used + want > *cap).map(|cap| format!("project {} is capped at {cap} {what} and holds {used}", project.name))
+    };
+    Ok(over(caps.vcpus.map(u64::from), used.vcpus as u64, want.vcpus as u64, "vcpu")
+        .or_else(|| over(caps.memory_mb, used.memory_mb, want.memory_mb, "MB of memory"))
+        .or_else(|| over(caps.disk_gb, used.disk_gb, want.disk_gb, "GB of disk")))
+}
+
+// ---- dry runs ------------------------------------------------------------------
+
+/// Would this instance be placed? The same rules as `choose`, without
+/// creating anything. Per-node detail is for admins only.
+pub fn check(conn: &Connection, project: &db::Project, spec: &InstanceSpec, hints: &Hints, admin: bool) -> Result<FitCheck> {
+    let mut largest = Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 };
+    let mut nodes = vec![];
+    for node in db::list_nodes(conn)? {
+        if node.arch != spec.arch || node.status != db::NodeDbStatus::Approved {
+            continue;
+        }
+        let free = free(&node, db::list_instances_on_node(conn, node.id)?.iter());
+        let eligible = node.online() && hints.node.is_none_or(|pinned| pinned == node.id);
+        if eligible {
+            largest.vcpus = largest.vcpus.max(free.vcpus);
+            largest.memory_mb = largest.memory_mb.max(free.memory_mb);
+            largest.disk_gb = largest.disk_gb.max(free.disk_gb);
+        }
+        nodes.push(NodeFit { node: node.id, hostname: node.hostname.clone(), status: node.public_status(), fits: eligible && fits(&free, spec), free });
+    }
+    let reason = if let Some(r) = quota_refusal(conn, project, spec, None)? {
+        Some(r)
+    } else if !nodes.iter().any(|n| n.status == NodeStatus::Online) {
+        Some(format!("no {} node is online", arch_name(spec.arch)))
+    } else if !nodes.iter().any(|n| n.fits) {
+        Some(format!(
+            "won't fit right now. the most any one machine can give is {} vcpu, {} MB of memory and {} GB of disk",
+            largest.vcpus, largest.memory_mb, largest.disk_gb
+        ))
+    } else {
+        None
+    };
+    Ok(FitCheck { fits: reason.is_none(), reason, largest, nodes: admin.then_some(nodes) })
+}
+
+pub fn arch_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "x86_64",
+        Arch::Aarch64 => "aarch64",
+    }
+}

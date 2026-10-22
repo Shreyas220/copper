@@ -19,13 +19,22 @@ Goals for copper, in the order they make sense to build. [design.md](design.md) 
 - [x] Instance resize: change vCPUs, memory and disk on a stopped instance.
 - [x] Placement hints: pin an instance to a node or spread a group across nodes, admin-only like placement today.
 
+## The console
+
+- [x] A web console served by kiln: overview, instances, a new-VM flow with a dry run, nodes, images, quotas, users and tokens.
+- [x] Browser sign-in with invite links and password resets.
+- [x] An event log behind history and "needs a look".
+- [x] Live metrics for VMs and nodes, the last hour.
+- [x] A serial console in the browser, on libvirt nodes.
+- [x] Per-project quotas, and named, revocable tokens.
+
 ## Later
 
-- TLS for kiln, so LAN binding doesn't expose tokens.
+- TLS for kiln, so LAN binding doesn't expose tokens or passwords.
+- Serial consoles on Tart nodes.
 - Containers: a `kind` field and a podman backend.
 - GPU passthrough of the whole card to one VM.
 - Data volumes and snapshots.
 - CKS: clusters of k3s VMs with a copper cloud controller and CSI driver.
-- Serial console through kiln, metrics and an event log.
-- A web UI, per-project quotas, and backups of kiln's database.
+- Backups of kiln's database, with a restore that can't resurrect deleted VMs.
 - Private networks per project, stable addresses and port forwarding.

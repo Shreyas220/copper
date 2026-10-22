@@ -1,0 +1,11 @@
+Third-party files bundled with the copper console.
+
+xterm.js 5.5.0 (vendor/xterm.js, vendor/xterm.css)
+  https://github.com/xtermjs/xterm.js · MIT License
+  Copyright (c) 2017-2019, The xterm.js authors; (c) 2014-2016, SourceLair; (c) 2012-2013, Christopher Jeffrey
+
+Geist (fonts/geist.woff2)
+  https://github.com/vercel/geist-font · SIL Open Font License 1.1
+
+IBM Plex Mono (fonts/plex-mono-*.woff2)
+  https://github.com/IBM/plex · SIL Open Font License 1.1

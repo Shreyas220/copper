@@ -73,7 +73,55 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE nodes ADD COLUMN disk_ratio REAL NOT NULL DEFAULT 1.0;
     ALTER TABLE instances ADD COLUMN spread TEXT;
     "#,
+    // v4: the console. Browser sign-in, invites, named tokens, quotas, the
+    // event log, and remembering which nodes have gone quiet.
+    r#"
+    ALTER TABLE users ADD COLUMN password_hash TEXT;
+    CREATE TABLE sessions (
+        hash       TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL REFERENCES users(id),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL
+    );
+    CREATE TABLE invites (
+        hash       TEXT PRIMARY KEY,
+        name       TEXT,                      -- fixed name, or NULL to let them choose
+        role       TEXT NOT NULL,
+        project    TEXT,                      -- project to create for them
+        created_by TEXT REFERENCES users(id),    -- NULL when made with `kiln invite`
+        expires_at INTEGER NOT NULL
+    );
+    ALTER TABLE tokens ADD COLUMN id TEXT;
+    ALTER TABLE tokens ADD COLUMN name TEXT NOT NULL DEFAULT 'cli';
+    ALTER TABLE tokens ADD COLUMN last_used_at INTEGER;
+    UPDATE tokens SET id = lower(hex(randomblob(8)));
+    CREATE UNIQUE INDEX tokens_by_id ON tokens(id);
+    ALTER TABLE projects ADD COLUMN quota_vcpus INTEGER;
+    ALTER TABLE projects ADD COLUMN quota_memory_mb INTEGER;
+    ALTER TABLE projects ADD COLUMN quota_disk_gb INTEGER;
+    ALTER TABLE instances ADD COLUMN running_since INTEGER;
+    ALTER TABLE nodes ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        at            INTEGER NOT NULL,
+        kind          TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        project_id    TEXT,
+        instance_id   TEXT,
+        instance_name TEXT,                   -- kept after the instance is gone
+        node_id       TEXT,
+        actor         TEXT
+    );
+    CREATE INDEX events_by_instance ON events(instance_id, id);
+    CREATE INDEX events_by_project ON events(project_id, id);
+    "#,
 ];
+
+mod events;
+mod people;
+pub use events::*;
+pub use people::*;
 
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -158,31 +206,43 @@ pub fn user_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<Us
     conn.query_row("SELECT id, name, role FROM users WHERE name = ?1", [name], user_from_row).optional()
 }
 
-pub fn insert_token(conn: &Connection, hash: &str, user: Uuid) -> rusqlite::Result<()> {
+/// Store a token's hash under a short random id the owner can revoke it by.
+pub fn insert_token(conn: &Connection, hash: &str, user: Uuid, name: &str) -> rusqlite::Result<String> {
+    let id = random_hex(8);
     conn.execute(
-        "INSERT INTO tokens (hash, user_id, created_at) VALUES (?1, ?2, ?3)",
-        params![hash, user.to_string(), now()],
+        "INSERT INTO tokens (hash, user_id, created_at, id, name) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![hash, user.to_string(), now(), id, name],
     )?;
-    Ok(())
+    Ok(id)
 }
 
-pub fn user_by_token_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<User>> {
-    conn.query_row(
-        "SELECT u.id, u.name, u.role FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.hash = ?1",
-        [hash],
-        user_from_row,
-    )
-    .optional()
+pub fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut b = vec![0u8; bytes];
+    rand::rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 // ---- projects ----------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Project {
     pub id: Uuid,
     pub name: String,
+    #[allow(dead_code)] // part of the row; ownership checks go through names
     pub owner_id: Uuid,
+    pub quota: QuotaCaps,
+}
+
+const PROJECT_COLS: &str = "p.id, p.name, p.owner_id, p.quota_vcpus, p.quota_memory_mb, p.quota_disk_gb";
+
+fn project_from_row(r: &Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: uuid_col(r, 0)?,
+        name: r.get(1)?,
+        owner_id: uuid_col(r, 2)?,
+        quota: QuotaCaps { vcpus: r.get(3)?, memory_mb: r.get::<_, Option<i64>>(4)?.map(|v| v as u64), disk_gb: r.get::<_, Option<i64>>(5)?.map(|v| v as u64) },
+    })
 }
 
 pub fn create_project(conn: &Connection, owner: Uuid, name: &str) -> rusqlite::Result<Project> {
@@ -191,22 +251,34 @@ pub fn create_project(conn: &Connection, owner: Uuid, name: &str) -> rusqlite::R
         "INSERT INTO projects (id, name, owner_id) VALUES (?1, ?2, ?3)",
         params![id.to_string(), name, owner.to_string()],
     )?;
-    Ok(Project { id, name: name.to_string(), owner_id: owner })
+    Ok(Project { id, name: name.to_string(), owner_id: owner, quota: QuotaCaps::default() })
 }
 
 pub fn project_by_name(conn: &Connection, owner: Uuid, name: &str) -> rusqlite::Result<Option<Project>> {
     conn.query_row(
-        "SELECT id, name, owner_id FROM projects WHERE owner_id = ?1 AND name = ?2",
+        &format!("SELECT {PROJECT_COLS} FROM projects p WHERE p.owner_id = ?1 AND p.name = ?2"),
         params![owner.to_string(), name],
-        |r| Ok(Project { id: uuid_col(r, 0)?, name: r.get(1)?, owner_id: uuid_col(r, 2)? }),
+        project_from_row,
     )
     .optional()
 }
 
+pub fn project_by_id(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<Project>> {
+    conn.query_row(&format!("SELECT {PROJECT_COLS} FROM projects p WHERE p.id = ?1"), [id.to_string()], project_from_row).optional()
+}
+
 pub fn list_projects(conn: &Connection, owner: Uuid) -> rusqlite::Result<Vec<Project>> {
-    conn.prepare("SELECT id, name, owner_id FROM projects WHERE owner_id = ?1 ORDER BY name")?
-        .query_map([owner.to_string()], |r| Ok(Project { id: uuid_col(r, 0)?, name: r.get(1)?, owner_id: uuid_col(r, 2)? }))?
+    conn.prepare(&format!("SELECT {PROJECT_COLS} FROM projects p WHERE p.owner_id = ?1 ORDER BY p.name"))?
+        .query_map([owner.to_string()], project_from_row)?
         .collect()
+}
+
+pub fn set_quota(conn: &Connection, project: Uuid, caps: &QuotaCaps) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE projects SET quota_vcpus = ?1, quota_memory_mb = ?2, quota_disk_gb = ?3 WHERE id = ?4",
+        params![caps.vcpus, caps.memory_mb.map(|v| v as i64), caps.disk_gb.map(|v| v as i64), project.to_string()],
+    )?;
+    Ok(())
 }
 
 // ---- nodes ---------------------------------------------------------------------
@@ -230,6 +302,8 @@ pub struct NodeRow {
     pub capacity: Capacity,
     pub token_hash: Option<String>,
     pub overcommit: Overcommit,
+    /// The sweeper logged that this node stopped reporting.
+    pub quiet: bool,
 }
 
 impl NodeRow {
@@ -245,7 +319,7 @@ impl NodeRow {
             NodeDbStatus::Approved => NodeStatus::Offline,
         }
     }
-    pub fn to_api(&self, allocated: Capacity) -> Node {
+    pub fn to_api(&self, allocated: Capacity, instances: Vec<String>, usage: Option<Usage>) -> Node {
         Node {
             id: self.id,
             hostname: self.hostname.clone(),
@@ -254,6 +328,11 @@ impl NodeRow {
             capacity: Some(self.capacity.clone()),
             allocated: Some(allocated),
             overcommit: self.overcommit,
+            fingerprint: self.token_hash.as_deref().map(fingerprint),
+            last_seen: self.last_seen,
+            generation: self.generation,
+            instances,
+            usage,
         }
     }
 }
@@ -270,10 +349,16 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?,
         token_hash: r.get(7)?,
         overcommit: Overcommit { cpu: r.get(8)?, memory: r.get(9)?, disk: r.get(10)? },
+        quiet: r.get(11)?,
     })
 }
 
-const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio";
+const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio, quiet";
+
+pub fn set_quiet(conn: &Connection, id: NodeId, quiet: bool) -> rusqlite::Result<()> {
+    conn.execute("UPDATE nodes SET quiet = ?1 WHERE id = ?2", params![quiet, id.to_string()])?;
+    Ok(())
+}
 
 pub fn node(conn: &Connection, id: NodeId) -> rusqlite::Result<Option<NodeRow>> {
     conn.query_row(&format!("SELECT {NODE_COLS} FROM nodes WHERE id = ?1"), [id.to_string()], node_from_row).optional()
@@ -349,6 +434,9 @@ pub struct InstanceRow {
     pub observed: Option<ObservedInstance>,
     /// Spread group within the project, used only by placement.
     pub spread: Option<String>,
+    pub created_at: i64,
+    /// When the node first reported it running after anything else.
+    pub running_since: Option<i64>,
 }
 
 fn instance_from_row(r: &Row) -> rusqlite::Result<InstanceRow> {
@@ -365,14 +453,17 @@ fn instance_from_row(r: &Row) -> rusqlite::Result<InstanceRow> {
             None => None,
         },
         spread: r.get(7)?,
+        created_at: r.get(8)?,
+        running_since: r.get(9)?,
     })
 }
 
-const INSTANCE_COLS: &str = "id, project_id, name, node_id, desired_state, spec_json, observed_json, spread";
+const INSTANCE_COLS: &str = "id, project_id, name, node_id, desired_state, spec_json, observed_json, spread, created_at, running_since";
 
 pub fn insert_instance(conn: &Connection, row: &InstanceRow) -> rusqlite::Result<()> {
     conn.execute(
-        &format!("INSERT INTO instances ({INSTANCE_COLS}, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)"),
+        "INSERT INTO instances (id, project_id, name, node_id, desired_state, spec_json, spread, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             row.id.to_string(),
             row.project_id.to_string(),
@@ -381,11 +472,17 @@ pub fn insert_instance(conn: &Connection, row: &InstanceRow) -> rusqlite::Result
             enum_to_text(&row.desired),
             serde_json::to_string(&row.spec).unwrap(),
             row.spread,
-            now()
+            row.created_at,
         ],
     )?;
     Ok(())
 }
+
+pub fn set_running_since(conn: &Connection, id: InstanceId, since: Option<i64>) -> rusqlite::Result<()> {
+    conn.execute("UPDATE instances SET running_since = ?1 WHERE id = ?2", params![since, id.to_string()])?;
+    Ok(())
+}
+
 
 pub fn set_spec(conn: &Connection, id: InstanceId, spec: &InstanceSpec) -> rusqlite::Result<()> {
     conn.execute("UPDATE instances SET spec_json = ?1 WHERE id = ?2", params![serde_json::to_string(spec).unwrap(), id.to_string()])?;
@@ -439,7 +536,7 @@ pub fn delete_instance(conn: &Connection, id: InstanceId) -> rusqlite::Result<()
 /// Mark every instance on a node as failed with the given reason. Used when a node is retired.
 pub fn fail_instances_on_node(conn: &Connection, node: NodeId, reason: &str) -> rusqlite::Result<()> {
     for row in list_instances_on_node(conn, node)? {
-        let obs = ObservedInstance { id: row.id, state: ObservedState::Failed, error: Some(reason.to_string()), addresses: vec![] };
+        let obs = ObservedInstance { id: row.id, state: ObservedState::Failed, error: Some(reason.to_string()), addresses: vec![], usage: None };
         set_observed(conn, &obs)?;
     }
     Ok(())
@@ -481,8 +578,8 @@ pub fn blob_referenced(conn: &Connection, sha256: &str) -> rusqlite::Result<bool
 }
 
 pub fn list_all_projects(conn: &Connection) -> rusqlite::Result<Vec<(Project, String)>> {
-    conn.prepare("SELECT p.id, p.name, p.owner_id, u.name FROM projects p JOIN users u ON p.owner_id = u.id ORDER BY u.name, p.name")?
-        .query_map([], |r| Ok((Project { id: uuid_col(r, 0)?, name: r.get(1)?, owner_id: uuid_col(r, 2)? }, r.get(3)?)))?.collect()
+    conn.prepare(&format!("SELECT {PROJECT_COLS}, u.name FROM projects p JOIN users u ON p.owner_id = u.id ORDER BY u.name, p.name"))?
+        .query_map([], |r| Ok((project_from_row(r)?, r.get(6)?)))?.collect()
 }
 
 #[cfg(test)]

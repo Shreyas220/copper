@@ -1,11 +1,16 @@
-//! Wire types shared by the controller, the agent and the CLI.
+//! Wire types shared by the controller, the agent, the CLI and the console.
 //!
-//! Two protocols live here:
 //! - `node`: controller <-> agent (desired state pull, observed state push)
-//! - `user`: what `cu` and any future UI talk to
+//! - `user`: instances, projects and nodes as `cu` and the console see them
+//! - `account`: sign-in, invites, users and tokens
+//! - `ops`: the event log, metrics, quotas and fit checks
 
+pub mod account;
 pub mod node;
+pub mod ops;
 pub mod user;
 
+pub use account::*;
 pub use node::*;
+pub use ops::*;
 pub use user::*;

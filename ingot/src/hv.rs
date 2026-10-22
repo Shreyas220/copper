@@ -53,6 +53,15 @@ pub trait Hypervisor {
     /// itself can't be asked, which must never be mistaken for absence.
     fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>>;
     fn addresses(&self, id: InstanceId) -> Vec<String>;
+
+    /// Live use of one running VM, when the platform can measure it.
+    fn usage(&self, _id: InstanceId) -> Option<Usage> {
+        None
+    }
+    /// Live use of the whole host.
+    fn host_usage(&self) -> Option<Usage> {
+        None
+    }
 }
 
 pub const PREFIX: &str = "copper-";

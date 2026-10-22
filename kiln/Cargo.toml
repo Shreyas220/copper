@@ -18,11 +18,13 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-axum = "0.8"
+# ws: the browser side of the serial console.
+axum = { version = "0.8", features = ["ws"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 rand = "0.9"
-futures-util = { version = "0.3", default-features = false }
+argon2 = "0.5"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # HTTP upgrades for the `cu ssh` tunnel; the same versions axum already uses.
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }

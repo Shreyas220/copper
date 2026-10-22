@@ -16,8 +16,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let admin = auth::issue_token(&conn, "admin", Some(Role::Admin)).unwrap();
-        let user = auth::issue_token(&conn, "alice", None).unwrap();
+        let admin = auth::issue_token(&conn, "admin", Some(Role::Admin), "cli").unwrap();
+        let user = auth::issue_token(&conn, "alice", None, "cli").unwrap();
         for name in ["admin", "alice"] {
             db::create_project(&conn, db::user_by_name(&conn, name).unwrap().unwrap().id, "default").unwrap();
         }
@@ -27,10 +27,9 @@ impl Fixture {
             capacity: Capacity { vcpus: 1, memory_mb: 1024, disk_gb: 10 } }, &auth::hash(&secret)).unwrap();
         db::set_node_status(&conn, node, db::NodeDbStatus::Approved).unwrap();
         db::touch_node(&conn, node, &Capacity { vcpus: 1, memory_mb: 1024, disk_gb: 10 }).unwrap();
-        let (changed, _) = tokio::sync::watch::channel(0);
         let catalog = std::env::temp_dir().join(format!("kiln-test-{}", uuid::Uuid::new_v4()));
-        let state = AppState { db: Arc::new(Mutex::new(conn)), changed, bridge: "br0".into(), catalog };
-        let app = axum::Router::new().merge(node_api::router()).merge(user_api::router()).with_state(state.clone());
+        let state = AppState::new(conn, "br0".into(), catalog);
+        let app = state.router();
         Self { state, app, admin, user, node, secret }
     }
     /// Another approved, online node.
@@ -42,6 +41,18 @@ impl Fixture {
         db::set_node_status(&conn, id, db::NodeDbStatus::Approved).unwrap();
         db::touch_node(&conn, id, &capacity).unwrap();
         id
+    }
+    /// A browser request: session cookie instead of a bearer token, and the
+    /// console's CSRF header unless `csrf` is false.
+    async fn browser(&self, method: &str, path: &str, cookie: &str, csrf: bool, body: Value) -> (StatusCode, Value, Option<String>) {
+        let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");
+        if !cookie.is_empty() { req = req.header("cookie", cookie) }
+        if csrf { req = req.header(CSRF_HEADER, "1") }
+        let resp = self.app.clone().oneshot(req.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+        let status = resp.status();
+        let set_cookie = resp.headers().get("set-cookie").map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string());
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() }, set_cookie)
     }
     fn instance_row(&self, name: &str) -> db::InstanceRow {
         let conn = self.state.db.lock().unwrap();
@@ -193,9 +204,9 @@ async fn admins_can_inspect_other_users_projects_without_exposing_them_to_users(
 fn issuing_a_token_preserves_role_unless_explicitly_changed() {
     let f = Fixture::new();
     let conn = f.state.db.lock().unwrap();
-    let token = auth::issue_token(&conn, "admin", None).unwrap();
-    assert_eq!(db::user_by_token_hash(&conn, &auth::hash(&token)).unwrap().unwrap().role, Role::Admin);
-    auth::issue_token(&conn, "admin", Some(Role::User)).unwrap();
+    let token = auth::issue_token(&conn, "admin", None, "cli").unwrap();
+    assert_eq!(db::token_user(&conn, &auth::hash(&token)).unwrap().unwrap().0.role, Role::Admin);
+    auth::issue_token(&conn, "admin", Some(Role::User), "cli").unwrap();
     assert_eq!(db::user_by_name(&conn, "admin").unwrap().unwrap().role, Role::User);
 }
 
@@ -376,4 +387,139 @@ async fn catalogue_images_bind_by_hash_and_are_served_only_to_nodes() {
     assert_eq!(status, StatusCode::CREATED);
     let local = f.instance_row("local").spec.boot_disk;
     assert_eq!((local.image.as_str(), local.sha256), ("debian-12", None));
+}
+
+// ---- the console's backend ---------------------------------------------------
+
+#[tokio::test]
+async fn invites_set_passwords_and_sessions_need_the_csrf_header_to_write() {
+    let f = Fixture::new();
+    let (status, invite) = f.call("POST", "/v1/invites", &f.admin, json!({"role": "user", "project": "games"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let code = invite["code"].as_str().unwrap();
+    assert_eq!(f.call("POST", "/v1/invites", &f.user, json!({})).await.0, StatusCode::FORBIDDEN);
+    // Anyone holding the link can see what it is for, and nothing more.
+    let (status, shown, _) = f.browser("GET", &format!("/v1/invites/{code}"), "", false, Value::Null).await;
+    assert_eq!((status, shown["project"].as_str()), (StatusCode::OK, Some("games")));
+    let accept = format!("/v1/invites/{code}/accept");
+    assert_eq!(f.browser("POST", &accept, "", false, json!({"name": "sam", "password": "short"})).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(f.browser("POST", &accept, "", false, json!({"name": "alice", "password": "long enough!"})).await.0, StatusCode::CONFLICT);
+    let (status, me, cookie) = f.browser("POST", &accept, "", false, json!({"name": "sam", "password": "long enough!"})).await;
+    assert_eq!((status, me["name"].as_str()), (StatusCode::OK, Some("sam")));
+    let cookie = cookie.unwrap();
+    assert_eq!(f.browser("POST", &accept, "", false, json!({"name": "sam2", "password": "long enough!"})).await.0, StatusCode::NOT_FOUND, "links work once");
+    // The cookie reads freely but writes only with the header.
+    assert_eq!(f.browser("GET", "/v1/projects/games/instances", &cookie, false, Value::Null).await.0, StatusCode::OK);
+    assert_eq!(f.browser("POST", "/v1/projects", &cookie, false, json!({"name": "lab"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(f.browser("POST", "/v1/projects", &cookie, true, json!({"name": "lab"})).await.0, StatusCode::CREATED);
+    // Sign out ends the session; signing in again starts a new one.
+    assert_eq!(f.browser("DELETE", "/v1/session", &cookie, true, Value::Null).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(f.browser("GET", "/v1/me", &cookie, false, Value::Null).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(f.browser("POST", "/v1/session", "", false, json!({"name": "sam", "password": "wrong password"})).await.0, StatusCode::UNAUTHORIZED);
+    let (status, _, again) = f.browser("POST", "/v1/session", "", false, json!({"name": "sam", "password": "long enough!"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f.browser("GET", "/v1/me", &again.unwrap(), false, Value::Null).await.1["name"], "sam");
+}
+
+#[tokio::test]
+async fn quotas_cap_creates_and_resizes_but_evict_nothing() {
+    let f = Fixture::new();
+    f.call("POST", &format!("/v1/nodes/{}/policy", f.node), &f.admin, json!({"cpu_ratio": 8.0, "memory_ratio": 8.0, "disk_ratio": 8.0})).await;
+    assert_eq!(f.create("one").await.0, StatusCode::CREATED);
+    assert_eq!(f.call("PUT", "/v1/projects/alice:default/quota", &f.user, json!({"vcpus": 1})).await.0, StatusCode::FORBIDDEN);
+    let (status, quota) = f.call("PUT", "/v1/projects/alice:default/quota", &f.admin, json!({"vcpus": 1})).await;
+    assert_eq!((status, quota["used"]["vcpus"].as_u64()), (StatusCode::OK, Some(1)));
+    let (status, body) = f.create("two").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["message"].as_str().unwrap().contains("capped at 1 vcpu"));
+    // Resizing within the cap is fine; growing past it is refused.
+    let id = f.instance_row("one").id.to_string();
+    f.call("POST", "/v1/projects/default/instances/one/stop", &f.user, Value::Null).await;
+    f.report_state(&id, "stopped").await;
+    assert_eq!(f.call("POST", "/v1/projects/default/instances/one/resize", &f.user, json!({"memory_mb": 512})).await.0, StatusCode::OK);
+    assert_eq!(f.call("POST", "/v1/projects/default/instances/one/resize", &f.user, json!({"vcpus": 2})).await.0, StatusCode::CONFLICT);
+    let (_, quotas) = f.call("GET", "/v1/quotas", &f.user, Value::Null).await;
+    assert_eq!(quotas.as_array().unwrap().len(), 1, "users see only their own projects");
+}
+
+#[tokio::test]
+async fn events_follow_what_happened_and_stay_inside_their_project() {
+    let f = Fixture::new();
+    let (_, vm) = f.create("vm").await;
+    let id = vm["id"].as_str().unwrap();
+    assert_eq!(f.report_state(id, "running").await, StatusCode::OK);
+    let (_, inst) = f.call("GET", "/v1/projects/default/instances/vm", &f.user, Value::Null).await;
+    assert!(inst["running_since"].as_i64().is_some());
+    assert_eq!(inst["owner"], "alice");
+    f.call("POST", "/v1/projects/default/instances/vm/stop", &f.user, Value::Null).await;
+    f.report_state(id, "stopped").await;
+    let (_, events) = f.call("GET", "/v1/events?project=default&instance=vm", &f.user, Value::Null).await;
+    let kinds: Vec<&str> = events.as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["stopped", "stop", "running", "created"], "newest first");
+    assert_eq!(events[1]["actor"], "alice");
+    assert!(events[2]["node"].is_null(), "users never see which node");
+    let (_, all) = f.call("GET", "/v1/events", &f.admin, Value::Null).await;
+    assert_eq!(all[2]["node"], "node");
+    // Admin's own project events stay out of alice's view.
+    f.call("POST", "/v1/projects/default/instances", &f.admin, json!({"name":"private","vcpus":1,"memory_mb":128,"arch":"x86_64","image":"ubuntu","disk_gb":1})).await;
+    let (_, mine) = f.call("GET", "/v1/events", &f.user, Value::Null).await;
+    assert!(mine.as_array().unwrap().iter().all(|e| e["instance"] != "private"));
+}
+
+#[tokio::test]
+async fn fit_checks_explain_refusals_and_show_nodes_to_admins_only() {
+    let f = Fixture::new();
+    let body = json!({"name":"big","vcpus":4,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10});
+    let (status, fit) = f.call("POST", "/v1/projects/default/instances/check", &f.user, body.clone()).await;
+    assert_eq!((status, fit["fits"].as_bool()), (StatusCode::OK, Some(false)));
+    assert!(fit["reason"].as_str().unwrap().contains("1 vcpu"));
+    assert!(fit["nodes"].is_null());
+    let (_, fit) = f.call("POST", "/v1/projects/default/instances/check", &f.admin, body).await;
+    assert_eq!(fit["nodes"][0]["hostname"], "node");
+    let small = json!({"name":"small","vcpus":1,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5});
+    assert_eq!(f.call("POST", "/v1/projects/default/instances/check", &f.user, small).await.1["fits"], true);
+    assert_eq!(f.call("GET", "/v1/projects/default/instances", &f.user, Value::Null).await.1, json!([]), "a check creates nothing");
+}
+
+#[tokio::test]
+async fn tokens_are_shown_once_listed_by_owner_and_revocable() {
+    let f = Fixture::new();
+    let (status, new) = f.call("POST", "/v1/tokens", &f.user, json!({"name": "laptop"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let secret = new["secret"].as_str().unwrap();
+    assert_eq!(f.call("GET", "/v1/me", secret, Value::Null).await.1["name"], "alice");
+    let (_, mine) = f.call("GET", "/v1/tokens", &f.user, Value::Null).await;
+    assert!(mine.as_array().unwrap().iter().all(|t| t["owner"] == "alice" && t.get("secret").is_none()));
+    let (_, everyone) = f.call("GET", "/v1/tokens", &f.admin, Value::Null).await;
+    let admin_token = everyone.as_array().unwrap().iter().find(|t| t["owner"] == "admin").unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(f.call("DELETE", &format!("/v1/tokens/{admin_token}"), &f.user, Value::Null).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(f.call("DELETE", &format!("/v1/tokens/{}", new["token"]["id"].as_str().unwrap()), &f.user, Value::Null).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(f.call("GET", "/v1/me", secret, Value::Null).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn removing_people_never_implies_deleting_their_vms() {
+    let f = Fixture::new();
+    f.create("vm").await;
+    assert_eq!(f.call("DELETE", "/v1/users/alice", &f.admin, Value::Null).await.0, StatusCode::CONFLICT);
+    assert_eq!(f.call("DELETE", "/v1/users/admin", &f.admin, Value::Null).await.0, StatusCode::CONFLICT, "not yourself");
+    assert_eq!(f.call("POST", "/v1/users/admin/role", &f.admin, json!({"role": "user"})).await.0, StatusCode::CONFLICT, "keep one admin");
+    let (_, users) = f.call("GET", "/v1/users", &f.admin, Value::Null).await;
+    assert_eq!(users.as_array().unwrap().len(), 2);
+    assert_eq!(f.call("GET", "/v1/users", &f.user, Value::Null).await.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_silent_node_is_logged_once_and_its_return_too() {
+    let f = Fixture::new();
+    {
+        let conn = f.state.db.lock().unwrap();
+        conn.execute("UPDATE nodes SET last_seen = last_seen - 120", []).unwrap();
+        crate::sweeper::mark_quiet_nodes(&conn).unwrap();
+        crate::sweeper::mark_quiet_nodes(&conn).unwrap();
+    }
+    f.report_state(&InstanceId::new_v4().to_string(), "absent").await;
+    let (_, events) = f.call("GET", "/v1/events", &f.admin, Value::Null).await;
+    let kinds: Vec<&str> = events.as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["node back", "node quiet"]);
 }

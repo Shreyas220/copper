@@ -220,10 +220,12 @@ impl<H: Hypervisor> Reconciler<H> {
                 (Ok(None), _) if self.hv.has_storage(id) => (ObservedState::Stopped, None),
                 (Ok(None), _) => (ObservedState::Absent, None),
             };
-            let addresses = if state == ObservedState::Running { self.hv.addresses(id) } else { vec![] };
-            ObservedInstance { id, state, error, addresses }
+            let running = state == ObservedState::Running;
+            let addresses = if running { self.hv.addresses(id) } else { vec![] };
+            let usage = if running { self.hv.usage(id) } else { None };
+            ObservedInstance { id, state, error, addresses, usage }
         }).collect();
-        ObservedNodeState { generation_seen: self.desired.generation, instances, capacity: self.capacity() }
+        ObservedNodeState { generation_seen: self.desired.generation, instances, capacity: self.capacity(), usage: self.hv.host_usage() }
     }
 }
 

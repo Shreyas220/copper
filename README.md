@@ -51,9 +51,19 @@ cu create web --vcpus 2 --memory 2048
 cu ls
 cu ssh web                         # through kiln, so it works over the tailnet too
 cu ssh-config web >> ~/.ssh/config # then: scp file web.copper:
-cu stop web                        # wait until cu ls says stopped, then:
-cu resize web --memory 4096 --disk 20 && cu start web
+cu stop web --wait && cu resize web --memory 4096 --disk 20 && cu start web
+cu log web                         # what happened to it, newest first
 cu node set <id> --cpu-ratio 4     # admin: let 8 threads back 32 vCPUs
 ```
 
 `install.sh --help` lists the options, including `--binaries target/release` to install a local build.
+
+## Console
+
+Kiln serves a web console on the same address as its API: `http://kiln:8400`. Nobody signs up; an admin sends invite links from the console. The first admin's link comes from the kiln machine:
+
+```sh
+sudo -u copper kiln --db /var/lib/copper/kiln.db invite --user you --role admin --url http://kiln:8400
+```
+
+The console shows instances with their history, live metrics and a serial console, plus nodes, images, quotas, users and tokens. `cu` keeps using tokens.

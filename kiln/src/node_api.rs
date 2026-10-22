@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::db::{self, NodeDbStatus, RegisterNodeOutcome};
 use crate::auth::bearer;
 use crate::error::{Error, Result};
+use crate::metrics::Subject;
 use crate::AppState;
 
 /// How long a desired-state long-poll waits before returning unchanged.
@@ -74,13 +75,19 @@ async fn register(State(state): State<AppState>, headers: HeaderMap, Json(req): 
     let conn = state.db.lock().unwrap();
     let token = bearer(&headers)?;
     if !valid_node_token(token) { return Err(Error::unauthorized()) }
-    let status = match db::register_node(&conn, &req, &crate::auth::hash(token))? {
+    let first_time = db::node(&conn, req.node_id)?.is_none();
+    let token_hash = crate::auth::hash(token);
+    let status = match db::register_node(&conn, &req, &token_hash)? {
         RegisterNodeOutcome::Registered(NodeDbStatus::Pending) => RegistrationStatus::Pending,
         RegisterNodeOutcome::Registered(NodeDbStatus::Approved) => RegistrationStatus::Approved,
         RegisterNodeOutcome::Registered(NodeDbStatus::Retired) => RegistrationStatus::Retired,
         RegisterNodeOutcome::CredentialMismatch => return Err(Error::unauthorized()),
     };
     tracing::info!(node = %req.node_id, host = %req.hostname, ?status, "node registered");
+    if first_time {
+        let detail = format!("{} wants in · key {}", req.hostname, fingerprint(&token_hash));
+        db::record(&conn, db::NewEvent::new("node wants in", detail).node(req.node_id))?;
+    }
     Ok(Json(RegisterResponse { status }))
 }
 
@@ -132,22 +139,36 @@ async fn observed(
     let node = authenticate(&conn, id, &headers)?;
     if report.generation_seen > node.generation { return Err(Error::bad_request("observed generation is ahead of desired state")) }
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    let now = db::now();
     let mut removed = false;
     let capacity = if report.generation_seen == node.generation { &report.capacity } else { &node.capacity };
     db::touch_node(&tx, id, capacity)?;
+    if node.quiet {
+        db::set_quiet(&tx, id, false)?;
+        db::record(&tx, db::NewEvent::new("node back", format!("{} is reporting again", node.hostname)).node(id))?;
+    }
+    if let Some(usage) = report.usage {
+        state.metrics.record(Subject::Node(id), now, usage);
+    }
     for obs in &report.instances {
         let Some(row) = db::instance(&tx, obs.id)? else { continue };
         if row.node_id != id {
             tracing::warn!(instance = %obs.id, node = %id, "report for an instance assigned elsewhere; ignored");
             continue;
         }
+        if let Some(usage) = obs.usage {
+            state.metrics.record(Subject::Instance(obs.id), now, usage);
+        }
         // Delete completes only once the node has confirmed the VM and disk are gone,
         // and only if that confirmation is for the generation that asked for it.
         if row.desired == DesiredState::Absent && obs.state == ObservedState::Absent && report.generation_seen >= node.generation {
             db::delete_instance(&tx, obs.id)?;
+            state.metrics.forget(Subject::Instance(obs.id));
+            db::record(&tx, db::NewEvent::new("removed", format!("vm and disk gone from {}", node.hostname)).instance(row.project_id, row.id, &row.name).node(id))?;
             removed = true;
             tracing::info!(instance = %obs.id, "instance removed");
         } else {
+            note_transition(&tx, &node, &row, obs, now)?;
             db::set_observed(&tx, obs)?;
         }
     }
@@ -157,7 +178,29 @@ async fn observed(
     Ok(())
 }
 
-fn authenticate(conn: &rusqlite::Connection, id: NodeId, headers: &HeaderMap) -> Result<db::NodeRow> {
+/// Log state changes the node reports, and remember when a run began.
+fn note_transition(conn: &rusqlite::Connection, node: &db::NodeRow, row: &db::InstanceRow, obs: &ObservedInstance, now: i64) -> rusqlite::Result<()> {
+    let before = row.observed.as_ref().map(|o| o.state);
+    if before == Some(obs.state) {
+        return Ok(());
+    }
+    let running = obs.state == ObservedState::Running;
+    if running != row.running_since.is_some() {
+        db::set_running_since(conn, row.id, running.then_some(now))?;
+    }
+    let event = match obs.state {
+        ObservedState::Running => db::NewEvent::new("running", match obs.addresses.first() {
+            Some(addr) => format!("on {} · {addr}", node.hostname),
+            None => format!("on {}", node.hostname),
+        }),
+        ObservedState::Stopped if before.is_some_and(|b| b != ObservedState::Absent) => db::NewEvent::new("stopped", format!("on {}", node.hostname)),
+        ObservedState::Failed => db::NewEvent::new("failed", obs.error.clone().unwrap_or_else(|| "no reason given".into())),
+        _ => return Ok(()),
+    };
+    db::record(conn, event.instance(row.project_id, row.id, &row.name).node(node.id))
+}
+
+pub(crate) fn authenticate(conn: &rusqlite::Connection, id: NodeId, headers: &HeaderMap) -> Result<db::NodeRow> {
     let token_hash = crate::auth::hash(bearer(headers)?);
     let node = db::node(conn, id)?.ok_or_else(Error::unauthorized)?;
     if node.token_hash.as_deref() != Some(token_hash.as_str()) { return Err(Error::unauthorized()) }

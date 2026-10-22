@@ -31,6 +31,26 @@ impl Kiln {
         Self { http, download, base: base.trim_end_matches('/').to_string(), node_id, token }
     }
 
+    /// Long-poll for serial console sessions someone opened on this node's VMs.
+    pub async fn console_requests(&self) -> anyhow::Result<Vec<ConsoleRequest>> {
+        let url = format!("{}/nodes/{}/consoles", self.base, self.node_id);
+        Ok(self.http.get(url).bearer_auth(&self.token).send().await?.error_for_status()?.json().await.context("decoding console requests")?)
+    }
+
+    /// Dial kiln back for one console session. The upgraded connection then
+    /// carries the VM's serial console both ways.
+    pub async fn attach_console(&self, session: uuid::Uuid) -> anyhow::Result<reqwest::Upgraded> {
+        let resp = self.download
+            .get(format!("{}/nodes/{}/consoles/{session}", self.base, self.node_id))
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONNECTION, "upgrade")
+            .header(reqwest::header::UPGRADE, "copper-console")
+            .send()
+            .await?;
+        anyhow::ensure!(resp.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS, "kiln refused the console: {}", resp.status());
+        Ok(resp.upgrade().await?)
+    }
+
     /// Download a catalogue blob to `dest`, verifying its SHA-256 on the way.
     /// Nothing appears at `dest` unless the hash matched.
     pub async fn fetch_image(&self, hash: &str, dest: &std::path::Path) -> anyhow::Result<()> {

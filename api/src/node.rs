@@ -132,6 +132,9 @@ pub struct ObservedInstance {
     pub error: Option<String>,
     #[serde(default)]
     pub addresses: Vec<String>,
+    /// Live resource use, when the backend can measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +143,38 @@ pub struct ObservedNodeState {
     pub generation_seen: Generation,
     pub instances: Vec<ObservedInstance>,
     pub capacity: Capacity,
+    /// Live resource use of the whole host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// A point-in-time reading. CPU is in tenths of a percent of what the thing
+/// was given: an instance's vCPUs, or a node's threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub cpu_permille: u32,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+}
+
+// ---- serial consoles ----------------------------------------------------------
+
+/// Someone wants a VM's serial console. The node dials back to kiln to carry
+/// it, so kiln still never connects to a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleRequest {
+    pub session: Uuid,
+    pub instance: InstanceId,
+}
+
+/// Short, human-comparable form of a node credential: the first 16 hex
+/// digits of its SHA-256, grouped. Ingot prints the same at registration, so
+/// an admin can check a pending node is the machine they think it is.
+pub fn fingerprint(token_sha256_hex: &str) -> String {
+    let head: String = token_sha256_hex.chars().take(16).collect();
+    head.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(" ")
 }
 
 /// A single image filename stem, never a path or hidden directory component.

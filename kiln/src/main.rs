@@ -1,12 +1,24 @@
-//! kiln: the copper control plane. SQLite source of truth, placement,
-//! user API, node API.
+//! kiln: the copper control plane. SQLite source of truth, placement, the
+//! node API, the user API and the web console.
+//!
+//! - `node_api`, `console` (node side): what ingot talks to.
+//! - `user_api`, `nodes_api`, `ops_api`, `people_api`: what cu and the
+//!   console talk to.
+//! - `ui`: the console's static files, built into the binary.
 
 mod auth;
 mod catalog;
+mod console;
 mod db;
 mod error;
+mod metrics;
 mod node_api;
+mod nodes_api;
+mod ops_api;
+mod people_api;
 mod placement;
+mod sweeper;
+mod ui;
 mod user_api;
 #[cfg(test)]
 mod tests;
@@ -55,6 +67,21 @@ enum Cmd {
         #[arg(long, value_enum)]
         role: Option<RoleArg>,
     },
+    /// Print a one-time link to set a console password. Use it to sign in
+    /// the first admin; later invites come from the console itself.
+    Invite {
+        /// The user, new or existing. Existing users get a password reset.
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long, value_enum)]
+        role: Option<RoleArg>,
+        /// Create this project for a new user.
+        #[arg(long)]
+        project: Option<String>,
+        /// Where people reach kiln, to print a whole link.
+        #[arg(long, default_value = "http://kiln:8400")]
+        url: String,
+    },
     /// Manage the image catalogue nodes fetch base images from.
     #[command(subcommand)]
     Image(ImageCmd),
@@ -95,6 +122,33 @@ pub struct AppState {
     pub changed: tokio::sync::watch::Sender<u64>,
     pub bridge: String,
     pub catalog: PathBuf,
+    pub metrics: Arc<metrics::Metrics>,
+    pub consoles: Arc<console::Consoles>,
+}
+
+impl AppState {
+    pub fn new(conn: rusqlite::Connection, bridge: String, catalog: PathBuf) -> Self {
+        Self {
+            db: Arc::new(Mutex::new(conn)),
+            changed: tokio::sync::watch::channel(0).0,
+            bridge,
+            catalog,
+            metrics: Arc::default(),
+            consoles: Arc::default(),
+        }
+    }
+
+    pub fn router(&self) -> axum::Router {
+        axum::Router::new()
+            .merge(node_api::router())
+            .merge(console::router())
+            .merge(user_api::router())
+            .merge(nodes_api::router())
+            .merge(ops_api::router())
+            .merge(people_api::router())
+            .merge(ui::router())
+            .with_state(self.clone())
+    }
 }
 
 /// Loopback and the tailnet are the trust boundaries kiln was designed for.
@@ -134,14 +188,23 @@ async fn main() -> anyhow::Result<()> {
             bridge: std::env::var("KILN_BRIDGE").unwrap_or_else(|_| "br0".into()),
         },
     };
+    let role_of = |role: Option<RoleArg>| {
+        role.map(|role| match role {
+            RoleArg::Admin => Role::Admin,
+            RoleArg::User => Role::User,
+        })
+    };
     match cmd {
         Cmd::Token { user, role } => {
-            let role = role.map(|role| match role {
-                RoleArg::Admin => Role::Admin,
-                RoleArg::User => Role::User,
-            });
-            let token = auth::issue_token(&conn, &user, role)?;
+            let token = auth::issue_token(&conn, &user, role_of(role), "cli")?;
             println!("{token}");
+            Ok(())
+        }
+        Cmd::Invite { user, role, project, url } => {
+            let req = copper_api::CreateInvite { name: user, role: role_of(role), project };
+            let invite = people_api::make_invite(&conn, &req, None).map_err(|e| anyhow::anyhow!("{}", e.1))?;
+            println!("{}/#/invite/{}", url.trim_end_matches('/'), invite.code);
+            eprintln!("works once, for 24 hours");
             Ok(())
         }
         Cmd::Image(ImageCmd::Import { name, arch, file }) => {
@@ -158,12 +221,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Serve { listen, bridge } => {
             anyhow::ensure!(!listen.is_empty(), "nothing to listen on");
-            let (changed, _) = tokio::sync::watch::channel(0);
-            let state = AppState { db: Arc::new(Mutex::new(conn)), changed, bridge, catalog };
-            let app = axum::Router::new()
-                .merge(node_api::router())
-                .merge(user_api::router())
-                .with_state(state);
+            let state = AppState::new(conn, bridge, catalog);
+            let app = state.router();
+            tokio::spawn(sweeper::run(state));
             let mut servers = tokio::task::JoinSet::new();
             for addr in listen {
                 if !trusted_network(addr.ip()) {

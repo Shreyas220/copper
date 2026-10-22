@@ -1,7 +1,10 @@
 //! libvirt backend. Every copper VM is a persistent domain named
 //! `copper-<instance id>`; anything else on the host is invisible to us.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context};
 use copper_api::*;
@@ -10,11 +13,15 @@ use virt::domain::Domain;
 use virt::sys;
 
 use crate::disk::Disks;
+use crate::host::HostUsage;
 use crate::hv::{name_of, DomState, Hypervisor};
 
 pub struct Libvirt {
     conn: Connect,
     pub disks: Disks,
+    host: HostUsage,
+    /// The last CPU time reading per VM, to turn the counter into a rate.
+    cpu_seen: Mutex<HashMap<InstanceId, (u64, Instant)>>,
 }
 
 fn err(e: virt::error::Error) -> anyhow::Error {
@@ -27,7 +34,43 @@ impl Libvirt {
         // expected "domain not found" from our lookups. We report errors ourselves.
         virt::error::clear_error_callback();
         let conn = Connect::open(Some(uri)).map_err(err).with_context(|| format!("connecting to {uri}"))?;
-        Ok(Self { conn, disks })
+        let host = HostUsage::new(disks.dir.clone());
+        Ok(Self { conn, disks, host, cpu_seen: Mutex::default() })
+    }
+
+    /// CPU as a share of the VM's own vCPUs, memory as the guest sees it
+    /// (balloon stats; the QEMU process's resident size before the guest
+    /// agent reports), disk as blocks the overlay really holds.
+    fn usage(&self, id: InstanceId) -> Option<Usage> {
+        let d = self.lookup(id).ok()??;
+        let info = d.get_info().ok()?;
+        let now = Instant::now();
+        let cpu_permille = {
+            let mut seen = self.cpu_seen.lock().unwrap();
+            let rate = match seen.get(&id) {
+                Some((t0, at)) if info.cpu_time >= *t0 && info.nr_virt_cpu > 0 => {
+                    let wall = now.duration_since(*at).as_nanos() as u64 * info.nr_virt_cpu as u64;
+                    if wall == 0 { 0 } else { ((info.cpu_time - t0) * 1000 / wall).min(1000) as u32 }
+                }
+                _ => 0,
+            };
+            seen.insert(id, (info.cpu_time, now));
+            rate
+        };
+        let total = info.max_mem * 1024;
+        let stats: HashMap<u32, u64> = d.memory_stats(0).map(|s| s.into_iter().map(|m| (m.tag, m.val * 1024)).collect()).unwrap_or_default();
+        let used = match (stats.get(&(sys::VIR_DOMAIN_MEMORY_STAT_AVAILABLE as u32)), stats.get(&(sys::VIR_DOMAIN_MEMORY_STAT_USABLE as u32))) {
+            (Some(available), Some(usable)) => available.saturating_sub(*usable),
+            _ => stats.get(&(sys::VIR_DOMAIN_MEMORY_STAT_RSS as u32)).copied().unwrap_or(0).min(total),
+        };
+        let disk = d.get_block_info("vda", 0).ok();
+        Some(Usage {
+            cpu_permille,
+            memory_used_bytes: used,
+            memory_total_bytes: total,
+            disk_used_bytes: disk.as_ref().map_or(0, |b| b.allocation),
+            disk_total_bytes: disk.as_ref().map_or(0, |b| b.capacity),
+        })
     }
 
     /// Host CPU threads and memory as libvirt sees them.
@@ -113,6 +156,7 @@ impl Libvirt {
     }
 
     pub fn undefine(&self, id: InstanceId) -> anyhow::Result<()> {
+        self.cpu_seen.lock().unwrap().remove(&id);
         let Some(d) = self.lookup(id)? else { return Ok(()) };
         if d.is_active().map_err(err)? {
             d.destroy().map_err(err)?;
@@ -205,7 +249,7 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
       <target type='virtio' name='org.qemu.guest_agent.0'/>
     </channel>
     <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>
-    <memballoon model='virtio'/>
+    <memballoon model='virtio'><stats period='10'/></memballoon>
   </devices>
 </domain>
 "#,
@@ -242,4 +286,6 @@ impl Hypervisor for Libvirt {
     fn reconfigure(&self, inst: &DesiredInstance) -> anyhow::Result<()> { self.reconfigure(inst) }
     fn state(&self, id: InstanceId) -> anyhow::Result<Option<DomState>> { self.state(id) }
     fn addresses(&self, id: InstanceId) -> Vec<String> { self.addresses(id) }
+    fn usage(&self, id: InstanceId) -> Option<Usage> { self.usage(id) }
+    fn host_usage(&self) -> Option<Usage> { self.host.read() }
 }

@@ -183,6 +183,10 @@ Then from any machine on the tailnet:
   export CU_URL=http://${listen%%,*}  CU_TOKEN=<token>
   cu project create default
 
+For the web console at http://${listen%%,*}, get a one-time link to set your password:
+
+  sudo -u copper kiln --db $STATE_DIR/kiln.db invite --user $(logname 2>/dev/null || echo admin) --role admin --url http://${listen%%,*}
+
 Add more base images, e.g. arm64 for a Mac node:
 
   sudo sh install.sh kiln --image-arch aarch64

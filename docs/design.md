@@ -86,7 +86,11 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 
 ## User API
 - Projects group instances and belong to a user. Users have a role of admin or user. Admins list all projects and address another user's project with `cu --project owner:project ...`; ordinary users can only access their own projects.
-- Auth is API tokens, stored hashed, created by the admin. `kiln token --user NAME` preserves existing roles; only an explicit `--role` changes one. New users default to role `user`.
+- `cu` authenticates with API tokens, stored hashed. `kiln token --user NAME` preserves existing roles; only an explicit `--role` changes one. New users default to role `user`. Tokens have names and can be listed and revoked by their owner, or by an admin.
+- The console authenticates with a session cookie (`HttpOnly`, `SameSite=Strict`, 30 days, extended while used). Passwords are Argon2id. Nobody signs up: an admin makes a one-time invite link, valid 24 hours, which sets a password and optionally creates a project; naming an existing user makes it a password reset. The first admin's link comes from `kiln invite` on the kiln machine.
+- Cookie-authenticated writes must carry an `x-copper` header. A cross-site page can't add it without a CORS preflight, which kiln never grants. The serial console's WebSocket also checks `Origin`.
+- Projects can have caps on vCPUs, memory and disk. Like capacity, a create or resize that would exceed one is refused up front; lowering a cap evicts nothing.
+- Removing a user revokes their tokens and sessions and drops their empty projects. Users who still have instances can't be removed: delete is never implied.
 - Kiln binds the Tailscale address by default. The tailnet is the trust boundary for v1.
 - `--listen` takes several addresses, so kiln can also serve the home LAN (`install.sh kiln --lan`). That is plain HTTP: user and node bearer tokens cross the LAN unencrypted, and kiln logs a warning for every listener outside loopback and the tailnet. TLS is not built.
 - `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.
@@ -97,3 +101,18 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - The tunnel only ever targets port 22. Addresses come from the guest agent, so a guest controls them: kiln only relays to private LAN addresses that are not its own, never to loopback, link-local or tailnet addresses. That reaches nothing a bridged guest couldn't reach itself.
 - Host keys are remembered under `copper-<instance id>`, because LAN addresses get reused but instance ids never do.
 - `cu ssh-config <name>` prints a `Host <name>.copper` entry for scp, rsync and editors. Its ProxyCommand reads `CU_TOKEN` from the environment; the token is never written to the file or passed as an argument.
+
+## Serial console
+- For when SSH won't. The browser opens a WebSocket to kiln for a running instance. Kiln records a pending session, and the instance's node learns of it through `GET /nodes/{id}/consoles`, a long-poll ingot keeps open. Ingot dials back with `Upgrade: copper-console` and pumps bytes between that connection and libvirt's console stream for the domain. Kiln never connects to a node.
+- Opening a console takes it from any other viewer. Tart nodes don't poll for consoles yet, so the browser is told after ten seconds.
+
+## Events and metrics
+- Kiln logs what happens in an `events` table: creates, start and stop requests, resizes, deletes and removals, what nodes report (running, stopped, failed with the error), node approvals, retirements and nodes going quiet and coming back, invites, tokens and quota changes. Ordinary users see events in their own projects without node names. Events are kept 90 days.
+- A sweeper checks every 10 s for approved nodes that stopped reporting, and logs "node quiet" once; the node's next report logs "node back".
+- Ingot reports usage with each observation: per VM, CPU as a share of its vCPUs from libvirt's CPU time, memory from the balloon driver (QEMU's resident size until the guest reports), disk as blocks the overlay holds; per host, from /proc and statvfs. Kiln keeps the last hour in memory only.
+- `running_since` is set when a node first reports an instance running after anything else, and cleared when it stops.
+
+## Console
+- Kiln serves the console from files built into the binary (`kiln/ui`, embedded by `build.rs`). It is plain JavaScript modules with no build step, and a plain client of the same API cu uses.
+- Every element shows something kiln returns or does something kiln does. There are no placeholders for unbuilt features.
+- Pages build the DOM with a helper that only ever sets text, so names and messages from the API can't inject markup. The content security policy allows scripts, styles and fonts only from kiln itself.

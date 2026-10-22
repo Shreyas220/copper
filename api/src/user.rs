@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::node::{Arch, Capacity, DesiredState, InstanceId, NodeId, ObservedState};
+use crate::node::{Arch, Capacity, DesiredState, InstanceId, NodeId, ObservedState, Usage};
 
 /// Instance state as the user sees it. Derived from (desired, observed, node online),
 /// never stored. See docs/design.md for the table.
@@ -60,6 +60,22 @@ pub struct Instance {
     /// Admin only: the spread group this instance was placed with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread: Option<String>,
+    /// Admin only: the node's hostname, for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    pub image: String,
+    /// Unix seconds.
+    #[serde(default)]
+    pub created_at: i64,
+    /// The project owner, who is the only non-admin who can touch it.
+    #[serde(default)]
+    pub owner: String,
+    /// Unix seconds when the node last reported it running after being
+    /// anything else. `None` unless running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_since: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +166,19 @@ pub struct Node {
     pub allocated: Option<Capacity>,
     #[serde(default)]
     pub overcommit: Overcommit,
+    /// See `fingerprint`. `None` until the node has registered a credential.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// Unix seconds of the last report.
+    #[serde(default)]
+    pub last_seen: Option<i64>,
+    #[serde(default)]
+    pub generation: u64,
+    /// Names of the instances assigned to it, as `project/name`.
+    #[serde(default)]
+    pub instances: Vec<String>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// A base image in kiln's catalogue.

@@ -2,7 +2,11 @@
 //! last desired state received from kiln, and reports what it observes.
 
 mod client;
+#[cfg(not(target_os = "macos"))]
+mod console;
 mod disk;
+#[cfg(not(target_os = "macos"))]
+mod host;
 mod hv;
 mod identity;
 mod images;
@@ -114,10 +118,14 @@ async fn run() -> anyhow::Result<()> {
     // authorizes resource changes. Existing VMs keep running while disconnected.
     let cached = state::load_desired(&opts.state_dir)?;
     let token = identity::load_or_create_token(&opts.state_dir)?;
+    let fingerprint = copper_api::fingerprint(&sha256_hex(&token));
     let kiln = Kiln::new(&opts.kiln, node_id, token);
     // Downloads are only requested by reconciliation, which only runs on a
     // fresh authorized desired state.
     tokio::spawn(images::fetch_loop(kiln.clone(), images, fetches));
+    #[cfg(not(target_os = "macos"))]
+    tokio::spawn(console::console_loop(kiln.clone(), opts.libvirt.clone()));
+    tracing::info!(%fingerprint, "node key; kiln shows the same when you approve");
     let register = RegisterRequest { node_id, hostname, arch, capacity: snapshot_capacity(&reconciler, cached.clone()).await };
     register_until_approved(&kiln, &register).await?;
 
@@ -138,6 +146,11 @@ fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Nati
 fn native_hypervisor(opts: &Opts, disks: disk::Disks) -> anyhow::Result<hv::Native> {
     let _ = &opts.libvirt; // meaningless on macOS; accepted so one env file works everywhere
     tart::Tart::new(disks, opts.bridge.clone())
+}
+
+fn sha256_hex(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
 fn hostname() -> String {

@@ -109,7 +109,12 @@ enum Cmd {
     #[command(subcommand)]
     Image(ImageCmd),
     /// Delete an instance. Final: the boot disk goes with it.
-    Rm { name: String },
+    Rm {
+        name: String,
+        /// Return once it's gone, so the name can be used again.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Admin: abandon tracking on a retired node. Does not erase host disks.
     Forget { id: InstanceId },
     /// Admin: nodes
@@ -218,6 +223,40 @@ async fn running_instance(c: &Client, project: &str, name: &str) -> anyhow::Resu
         bail!("{name} is {}; it must be running", serde_json::to_string(&i.state)?.trim_matches('"'));
     }
     Ok(i)
+}
+
+/// Poll until kiln no longer knows the instance: its node has removed it.
+async fn wait_gone(c: &Client, project: &str, name: &str) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let resp = c.http.get(format!("{}/v1/projects/{project}/instances/{name}", c.url)).bearer_auth(&c.token).send().await.context("connecting to kiln")?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("{name} is still being deleted after 5 minutes; is its node online?");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Say why ssh would refuse before it does. Keys are only written when a VM
+/// is first made, so one made without a key can only be recreated.
+async fn check_keys(c: &Client, i: &Instance) -> anyhow::Result<()> {
+    if i.ssh_keys.is_empty() {
+        bail!(
+            "{n} was made without an ssh key, so nobody can log in to it.\n\
+             keys are only written when a vm is first made; to recreate it with your saved keys:\n  \
+             cu rm {n} --wait && cu create {n} --vcpus {} --memory {} --disk {} --image {}",
+            i.vcpus, i.memory_mb, i.disk_gb, i.image, n = i.name
+        );
+    }
+    let saved: Vec<SshKey> = c.call(Method::GET, "/v1/keys", None).await.unwrap_or_default();
+    if !saved.is_empty() && !i.ssh_keys.iter().any(|k| saved.iter().any(|s| s.fingerprint == k.fingerprint)) {
+        let has: Vec<_> = i.ssh_keys.iter().map(|k| k.comment.as_deref().unwrap_or(&k.fingerprint)).collect();
+        eprintln!("cu: none of your saved keys is on {}; it has {}", i.name, has.join(", "));
+    }
+    Ok(())
 }
 
 /// Upgrade an HTTP request to kiln into a byte stream to the instance's SSH
@@ -395,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Ssh { name, user, command } => {
             let i = running_instance(&c, p, &name).await?;
+            check_keys(&c, &i).await?;
             let mut ssh = std::process::Command::new("ssh");
             // The token reaches the ProxyCommand through the environment,
             // never through arguments other users could see in ps.
@@ -464,9 +504,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("{:>8}  {:<14} {:<20} {}{who}", ago(now - e.at), e.kind, e.instance.unwrap_or_default(), e.detail);
             }
         }
-        Cmd::Rm { name } => {
+        Cmd::Rm { name, wait } => {
             let _: () = c.call(Method::DELETE, &format!("/v1/projects/{p}/instances/{name}"), None).await?;
             println!("deleting {name}");
+            if wait {
+                wait_gone(&c, p, &name).await?;
+                println!("{name} is gone");
+            }
         }
         Cmd::Forget { id } => {
             let _: () = c.call(Method::POST, &format!("/v1/instances/{id}/forget"), None).await?;

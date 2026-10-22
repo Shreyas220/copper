@@ -19,7 +19,15 @@ drop_namespaces() {
 }
 drop_namespaces
 tmp=$(mktemp -d)
-trap 'kill $(jobs -p) 2>/dev/null; drop_namespaces; rm -rf "$tmp"' EXIT
+listeners=""
+cleanup() {
+  status=$?
+  [ -z "$listeners" ] || kill $listeners 2>/dev/null || true
+  drop_namespaces
+  rm -rf "$tmp"
+  exit "$status"
+}
+trap cleanup EXIT
 
 # Run a command inside a namespace.
 on() { ns=$1; shift; ip netns exec "$ns" "$@"; }
@@ -59,6 +67,7 @@ s.bind((sys.argv[1], int(sys.argv[2]))); s.listen()
 while True:
     c, peer = s.accept(); open(sys.argv[3], "a").write(peer[0] + "\n"); c.close()
 ' "$addr" "$port" "$tmp/$ns-$port" &
+  listeners="$listeners $!"
 }
 reaches() {
   on "$1" python3 -c '

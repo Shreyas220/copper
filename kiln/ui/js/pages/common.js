@@ -5,38 +5,38 @@ import { enc, get, post } from '../api.js';
 import { h } from '../dom.js';
 import { shape, since } from '../format.js';
 import { createProject, isAdmin, session } from '../session.js';
-import { button, field, input, notice, stateBadge, table, toast } from '../ui.js';
+import { button, field, input, notice, st, table, toast } from '../ui.js';
 
 export const projectUrl = (rest = '') => `/v1/projects/${enc(session.project)}${rest}`;
 export const instanceUrl = (name, rest = '') => projectUrl(`/instances/${enc(name)}${rest}`);
+export const instanceHref = (name) => `#/instances/${enc(name)}`;
 
 export async function listInstances() {
   return session.project ? get(projectUrl('/instances')) : [];
 }
 
 /** Sorted by state, then name, like `cu ls`. With `onChange`, each row also
- *  gets the action its state allows. */
+ *  gets the actions its state allows. */
 export function instanceTable(instances, onChange) {
   const order = ['failed', 'unknown', 'starting', 'stopping', 'deleting', 'running', 'stopped'];
   const rows = [...instances].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state) || a.name.localeCompare(b.name));
   return table([
-    { title: 'name', cell: (i) => h('a', { href: `#/instances/${enc(i.name)}` }, i.name) },
-    { title: 'you see', cell: (i) => stateBadge(i.state) },
+    { title: 'name', class: 'name', cell: (i) => h('a', { href: instanceHref(i.name) }, i.name) },
+    { title: 'you see', cell: (i) => st(i.state) },
     isAdmin() ? { title: 'node', cell: (i) => i.node_name ?? '—', class: 'hide-sm' } : null,
     { title: 'shape', cell: (i) => shape(i), class: 'hide-sm' },
     { title: 'image', cell: (i) => i.image, class: 'hide-sm' },
     { title: 'address', cell: (i) => i.addresses[0] ?? '—' },
     { title: 'up', cell: (i) => (i.running_since ? since(i.running_since) : '—') },
-    onChange ? { title: '', cell: (i) => rowAction(i, onChange) } : null,
-  ].filter(Boolean), rows, (i) => (location.hash = `#/instances/${enc(i.name)}`));
+    onChange ? { title: '', class: 'act', cell: (i) => rowActions(i, onChange) } : null,
+  ].filter(Boolean), rows, (i) => (location.hash = instanceHref(i.name)));
 }
 
-/** The one thing kiln lets you do from here in each state. */
-function rowAction(i, onChange) {
-  const run = (text, fn) => {
-    const btn = button(text, { small: true });
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
+/** What kiln lets you do from here in each state. */
+function rowActions(i, onChange) {
+  const run = (text, fn, opts = {}) => {
+    const btn = button(text, { small: true, ...opts });
+    btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
         await fn((t) => (btn.textContent = t));
@@ -53,11 +53,11 @@ function rowAction(i, onChange) {
     case 'starting':
       return run('stop', () => post(instanceUrl(i.name, '/stop')));
     case 'stopped':
-      return run('start', () => post(instanceUrl(i.name, '/start')));
+      return [run('start', () => post(instanceUrl(i.name, '/start'))), button('resize', { small: true, href: instanceHref(i.name) })];
     case 'failed':
-      return run('stop + start', (progress) => stopThenStart(i.name, progress));
+      return run('stop + start', (progress) => stopThenStart(i.name, progress), { warm: true });
     case 'unknown':
-      return button('look ›', { small: true, href: `#/instances/${enc(i.name)}` });
+      return button('look ›', { small: true, href: instanceHref(i.name) });
     default:
       return null;
   }

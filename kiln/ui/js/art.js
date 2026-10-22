@@ -39,17 +39,20 @@ const SCENES = [
 ];
 const ORDER = ['kiln', 'online', 'offline', 'waiting'];
 
+/** Kiln's machine first, then online, offline and waiting ones, by name. */
+export const byRole = (a, b) => ORDER.indexOf(role(a)) - ORDER.indexOf(role(b)) || a.hostname.localeCompare(b.hostname);
+
 /** FIG.0: the machines as one drawing, or one slab each when no drawing
  *  matches them. */
 export function stack(nodes) {
-  const drawn = nodes.filter((n) => role(n)).sort((a, b) => ORDER.indexOf(role(a)) - ORDER.indexOf(role(b)) || a.hostname.localeCompare(b.hostname));
+  const drawn = nodes.filter((n) => role(n)).sort(byRole);
   const roles = drawn.map(role).join(' ');
   const scene = SCENES.find((s) => s.roles.join(' ') === roles);
   const legend = h('nav', { class: 'legend', 'aria-label': 'machines' }, drawn.map((n, i) =>
     h('a', { href: '#/nodes' }, dot(n.status, n.status === 'pending'), `${String(i + 1).padStart(2, '0')} ${n.hostname}`, h('span', {}, nodeNote(n)))));
   if (!scene) {
     return h('div', {},
-      h('div', { class: 'slab-grid' }, drawn.map((n, i) => h('figure', { class: 'scene' }, slab(n), callout(n, i, { left: 50, top: 78, center: true })))),
+      h('div', { class: 'slab-grid', style: { '--n': Math.min(drawn.length, 4) } }, drawn.map((n, i) => h('figure', { class: 'scene' }, slab(n), callout(n, i, { left: 50, top: 78, center: true })))),
       legend);
   }
   return h('div', {},
@@ -67,5 +70,7 @@ export function callout(n, i, at) {
   else pos.left = `${at.left}%`;
   return h('a', { class: `callout${at.right != null ? ' flip' : ''}${at.center ? ' center' : ''}`, href: '#/nodes', style: pos },
     h('span', { class: 'leader', 'aria-hidden': 'true' }), h('span', { class: 'pin', 'aria-hidden': 'true' }),
-    h('span', { class: 'tagbox' }, dot(n.status, n.status === 'pending'), `${String(i + 1).padStart(2, '0')} ${n.hostname}`, h('small', {}, nodeNote(n))));
+    h('span', { class: 'tagbox' },
+      h('span', {}, dot(n.status, n.status === 'pending'), `${String(i + 1).padStart(2, '0')} ${n.hostname}`),
+      h('small', {}, nodeNote(n))));
 }

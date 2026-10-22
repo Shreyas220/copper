@@ -11,7 +11,6 @@ export default async function people() {
   return [
     h('section', {}, h('div', { class: 'head' }, title('Users & tokens.', users ? `${plural(users.length, 'person', 'people')}, ${plural(tokens.length, 'token')}.` : `${plural(tokens.length, 'token')}.`))),
     users ? h('section', {}, peopleList(users)) : null,
-    users ? h('section', {}, inviteForm()) : null,
     h('section', {}, tokenList(tokens)),
   ];
 }
@@ -19,16 +18,17 @@ export default async function people() {
 const reload = () => window.dispatchEvent(new HashChangeEvent('hashchange'));
 
 function peopleList(users) {
-  return h('div', {},
-    h('div', { class: 'pad' }, subtitle('People.')),
+  return h('div', { style: { paddingBottom: '28px' } },
+    h('div', { class: 'head', style: { paddingTop: '56px' } }, subtitle('People.')),
     table([
-      { title: 'name', cell: (u) => u.name },
-      { title: 'role', cell: (u) => u.role },
+      { title: 'name', cell: (u) => u.name, class: 'name' },
+      { title: 'role', cell: (u) => h('span', { style: u.role === 'admin' ? { color: 'var(--cu)' } : {} }, u.role) },
       { title: 'projects', cell: (u) => u.projects.join(', ') || '—' },
       { title: 'console', cell: (u) => (u.has_password ? 'can sign in' : 'cu only'), class: 'hide-sm' },
       { title: 'last seen', cell: (u) => (u.last_seen ? `${ago(u.last_seen)} ago` : '—') },
-      { title: '', cell: (u) => (u.name === session.me.name ? h('span', { class: 'hint' }, 'you') : userActions(u)) },
-    ], users));
+      { title: '', cell: (u) => (u.name === session.me.name ? h('span', { class: 'hint' }, 'you') : userActions(u)), class: 'act' },
+    ], users),
+    h('div', { class: 'pad' }, inviteForm()));
 }
 
 function userActions(u) {
@@ -48,19 +48,18 @@ function userActions(u) {
     await act(remove, () => del(`/v1/users/${enc(u.name)}`), `${u.name} removed`);
     reload();
   });
-  return h('div', { class: 'row', style: { gap: '6px' } }, role, reset, remove);
+  return [role, reset, remove];
 }
 
 function inviteForm() {
-  const name = input({ placeholder: 'leave empty to let them choose', pattern: '[a-z0-9]([a-z0-9-]*[a-z0-9])?' });
+  const name = input({ placeholder: 'they choose', pattern: '[a-z0-9]([a-z0-9-]*[a-z0-9])?' });
   const role = h('select', { class: 'input' }, h('option', { value: 'user' }, 'user'), h('option', { value: 'admin' }, 'admin'));
-  const project = input({ placeholder: 'e.g. games · optional' });
+  const project = input({ placeholder: 'none', pattern: '[a-z0-9]([a-z0-9-]*[a-z0-9])?' });
   const make = button('make invite link ›', { primary: true, type: 'submit' });
   const out = h('div');
-  const form = h('form', { class: 'pad stack' },
-    subtitle('Invite someone.'),
-    h('div', { class: 'cells four', style: { background: 'none', gap: '16px' } }, field('name', name), field('role', role), field('project', project)),
-    h('div', { class: 'row' }, make),
+  const form = h('form', { class: 'panel' },
+    h('span', { class: 'label' }, 'invite someone'),
+    h('div', { class: 'invite-row' }, field('name', name), field('role', role), field('new project', project), make),
     out);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -75,15 +74,15 @@ function inviteForm() {
 function showLink(where, invite) {
   const url = `${location.origin}/#/invite/${invite.code}`;
   const hours = Math.round((invite.expires_at - Date.now() / 1000) / 3600);
-  fill(where, h('div', { class: 'stack', style: { marginTop: '10px' } },
-    copyBlock(`${invite.reset ? 'password reset' : 'invite'} · ${invite.role} · one use · expires in ${hours} h`, [url])));
+  fill(where, h('div', { class: 'stack', style: { marginTop: '10px', textAlign: 'left' } },
+    copyBlock(`${invite.reset ? 'password reset' : 'send this'} · ${invite.role} · works once · ${hours} h`, [url])));
 }
 
 function tokenList(tokens) {
-  const name = input({ placeholder: 'laptop', required: true, maxlength: 64 });
+  const name = input({ placeholder: 'laptop', required: true, maxlength: 64, 'aria-label': 'token name', style: { width: '200px' } });
   const make = button('new token ›', { primary: true, type: 'submit' });
-  const out = h('div');
-  const form = h('form', { class: 'row', style: { alignItems: 'flex-end' } }, h('div', { style: { flex: '1', maxWidth: '360px' } }, field('name', name)), make);
+  const out = h('div', { class: 'pad', style: { paddingTop: 0 } });
+  const form = h('form', { class: 'row', style: { gap: '8px' } }, name, make);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const made = await act(make, () => post('/v1/tokens', { name: name.value.trim() }));
@@ -91,21 +90,24 @@ function tokenList(tokens) {
       // Kiln returns the secret this once and stores only its hash.
       fill(out, copyBlock(`${made.token.name} · shown once`, [`$ export CU_URL=${location.origin} CU_TOKEN=${made.secret}`]));
       name.value = '';
-      fill(list, tokenTable([...tokens, made.token]));
+      tokens = [...tokens, made.token];
+      fill(list, tokenTable(tokens));
     }
   });
   const list = h('div', {}, tokenTable(tokens));
-  return h('div', { class: 'pad stack' }, subtitle('Tokens.'), list, form, out);
+  return h('div', { style: { paddingBottom: '28px' } },
+    h('div', { class: 'head row spread', style: { flexDirection: 'row', paddingTop: '56px' } }, subtitle('Tokens.', 'For cu.'), form),
+    list, out);
 }
 
 function tokenTable(tokens) {
   if (!tokens.length) return empty('no tokens yet.');
   return table([
-    { title: 'token', cell: (t) => t.name },
+    { title: 'token', cell: (t) => t.name, class: 'name' },
     { title: 'owner', cell: (t) => t.owner },
     { title: 'made', cell: (t) => `${ago(t.created_at)} ago` },
     { title: 'last used', cell: (t) => (t.last_used ? `${ago(t.last_used)} ago` : 'never') },
-    { title: '', cell: (t) => revoke(t) },
+    { title: '', cell: (t) => revoke(t), class: 'act' },
   ], tokens);
 }
 

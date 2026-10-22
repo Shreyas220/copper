@@ -11,11 +11,11 @@ export function door(form) {
       h('figure', { class: 'door-art' },
         h('img', { src: '/ui/art/stack-1.png', alt: 'halftone drawing of a single copper slab lit from behind, floating above still water' }),
         h('figcaption', { class: 'label' }, 'FIG.0 · copper')),
-      form),
+      h('div', { class: 'form-side' }, form)),
     h('p', { class: 'label where' }, location.host));
 }
 
-export const brandRow = () => h('div', { class: 'row', style: { font: "600 18px/1 var(--mono)" } }, logo(), 'copper');
+export const brandRow = () => h('div', { class: 'row', style: { gap: '10px', font: '600 18px/1 var(--mono)' } }, logo(), 'copper');
 
 export default async function signin() {
   const name = input({ name: 'name', autocomplete: 'username', required: true, autofocus: true });

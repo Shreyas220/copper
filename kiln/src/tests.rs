@@ -5,6 +5,8 @@ use copper_api::*;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtleWZvcnRoZWtpbG50ZXN0czAwMDAwMDAwMDAw alice@laptop";
+
 struct Fixture {
     state: AppState,
     app: axum::Router,
@@ -75,7 +77,7 @@ impl Fixture {
         (status, if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() })
     }
     async fn create(&self, name: &str) -> (StatusCode, Value) {
-        self.call("POST", "/v1/projects/default/instances", &self.user, json!({"name":name,"vcpus":1,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10})).await
+        self.call("POST", "/v1/projects/default/instances", &self.user, json!({"name":name,"vcpus":1,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10,"ssh_keys":[KEY]})).await
     }
     fn report(&self, id: &str, generation: u64) -> Value {
         json!({"generation_seen":generation,"instances":[{"id":id,"state":"absent"}],"capacity":{"vcpus":1,"memory_mb":1024,"disk_gb":10}})
@@ -330,7 +332,7 @@ async fn placement_hints_pin_or_spread_and_are_admin_only() {
     let big = Capacity { vcpus: 8, memory_mb: 16384, disk_gb: 200 };
     let (a, b) = (f.add_node(big.clone()), f.add_node(big));
     let body = |name: &str, extra: Value| {
-        let mut v = json!({"name":name,"vcpus":1,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10});
+        let mut v = json!({"name":name,"vcpus":1,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10,"ssh_keys":[KEY]});
         v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         v
     };
@@ -383,7 +385,7 @@ async fn catalogue_images_bind_by_hash_and_are_served_only_to_nodes() {
     // An image the catalogue doesn't know stays a node-local name.
     f.call("POST", &format!("/v1/nodes/{}/policy", f.node), &f.admin, json!({"cpu_ratio": 4.0, "memory_ratio": 4.0, "disk_ratio": 4.0})).await;
     let (status, _) = f.call("POST", "/v1/projects/default/instances", &f.user,
-        json!({"name":"local","vcpus":1,"memory_mb":128,"arch":"x86_64","image":"debian-12","disk_gb":1})).await;
+        json!({"name":"local","vcpus":1,"memory_mb":128,"arch":"x86_64","image":"debian-12","disk_gb":1,"ssh_keys":[KEY]})).await;
     assert_eq!(status, StatusCode::CREATED);
     let local = f.instance_row("local").spec.boot_disk;
     assert_eq!((local.image.as_str(), local.sha256), ("debian-12", None));
@@ -432,6 +434,10 @@ async fn quotas_cap_creates_and_resizes_but_evict_nothing() {
     let (status, body) = f.create("two").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["message"].as_str().unwrap().contains("capped at 1 vcpu"));
+    // The dry run's "most you could have" counts the cap, not just the node.
+    let check = json!({"name":"two","vcpus":4,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5});
+    let (_, fit) = f.call("POST", "/v1/projects/default/instances/check", &f.user, check).await;
+    assert_eq!((fit["fits"].as_bool(), fit["largest"]["vcpus"].as_u64()), (Some(false), Some(0)));
     // Resizing within the cap is fine; growing past it is refused.
     let id = f.instance_row("one").id.to_string();
     f.call("POST", "/v1/projects/default/instances/one/stop", &f.user, Value::Null).await;
@@ -461,7 +467,7 @@ async fn events_follow_what_happened_and_stay_inside_their_project() {
     let (_, all) = f.call("GET", "/v1/events", &f.admin, Value::Null).await;
     assert_eq!(all[2]["node"], "node");
     // Admin's own project events stay out of alice's view.
-    f.call("POST", "/v1/projects/default/instances", &f.admin, json!({"name":"private","vcpus":1,"memory_mb":128,"arch":"x86_64","image":"ubuntu","disk_gb":1})).await;
+    f.call("POST", "/v1/projects/default/instances", &f.admin, json!({"name":"private","vcpus":1,"memory_mb":128,"arch":"x86_64","image":"ubuntu","disk_gb":1,"ssh_keys":[KEY]})).await;
     let (_, mine) = f.call("GET", "/v1/events", &f.user, Value::Null).await;
     assert!(mine.as_array().unwrap().iter().all(|e| e["instance"] != "private"));
 }
@@ -479,6 +485,24 @@ async fn fit_checks_explain_refusals_and_show_nodes_to_admins_only() {
     let small = json!({"name":"small","vcpus":1,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5});
     assert_eq!(f.call("POST", "/v1/projects/default/instances/check", &f.user, small).await.1["fits"], true);
     assert_eq!(f.call("GET", "/v1/projects/default/instances", &f.user, Value::Null).await.1, json!([]), "a check creates nothing");
+}
+
+#[tokio::test]
+async fn a_vm_needs_a_public_ssh_key() {
+    let f = Fixture::new();
+    let create = "/v1/projects/default/instances";
+    let body = |keys: Value| json!({"name":"vm","vcpus":1,"memory_mb":512,"arch":"x86_64","image":"ubuntu","disk_gb":5,"ssh_keys":keys});
+    let (status, err) = f.call("POST", create, &f.user, body(json!([]))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["message"].as_str().unwrap().contains("ssh key"));
+    let private = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----";
+    assert_eq!(f.call("POST", create, &f.user, body(json!([private]))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(f.call("POST", create, &f.user, body(json!([format!("{KEY}\nruncmd: [reboot]")]))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(f.call("POST", create, &f.user, body(json!(["alice@laptop"]))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(f.call("GET", create, &f.user, Value::Null).await.1, json!([]), "nothing made");
+    // The dry run doesn't need one: the console checks a shape before the key is in.
+    assert_eq!(f.call("POST", &format!("{create}/check"), &f.user, body(json!([]))).await.0, StatusCode::OK);
+    assert_eq!(f.call("POST", create, &f.user, body(json!([KEY]))).await.0, StatusCode::CREATED);
 }
 
 #[tokio::test]

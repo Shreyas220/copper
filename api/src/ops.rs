@@ -68,7 +68,8 @@ pub struct FitCheck {
     /// Why not, in words, when it doesn't.
     #[serde(default)]
     pub reason: Option<String>,
-    /// The most any single node of this arch could take right now.
+    /// The most any single node of this arch could take right now, bounded
+    /// by what the project's quota still allows.
     pub largest: Capacity,
     /// Per-node detail. Admin only, since only admins see placement.
     #[serde(default)]

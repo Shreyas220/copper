@@ -11,6 +11,8 @@ const SHAPES = [
   { id: 'chonky', vcpus: 4, memory_gb: 8 },
 ];
 const NAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+// What kiln accepts: one line of an OpenSSH public key, as in ~/.ssh/id_ed25519.pub.
+const KEY = /^(ssh-|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)\S*\s+[A-Za-z0-9+/=]{16,}(\s[^\n\r]*)?$/;
 const KEY_STORE = 'copper.ssh-key';
 
 /** New VM, as one page of steps. Every change asks kiln for a fresh dry run;
@@ -44,8 +46,12 @@ export default async function create(ctx) {
   });
   const project = h('select', { class: 'input' }, session.projects.map((p) => h('option', { value: projectPath(p), selected: projectPath(p) === want.project }, projectPath(p))));
   project.addEventListener('change', () => { want.project = project.value; changed(); });
-  const key = input({ value: want.ssh_key, placeholder: 'ssh-ed25519 AAAA… you@laptop', spellcheck: 'false' });
-  key.addEventListener('input', () => (want.ssh_key = key.value.trim()));
+  const key = input({ value: want.ssh_key, placeholder: 'ssh-ed25519 AAAA… you@laptop', spellcheck: 'false', required: true });
+  key.addEventListener('input', () => {
+    want.ssh_key = key.value.trim();
+    key.setAttribute('aria-invalid', want.ssh_key && !KEY.test(want.ssh_key) ? 'true' : 'false');
+    update();
+  });
   blocks.name = h('div', { class: 'step' },
     h('div', { class: 'cells three flat' }, field('name', name, h('span', { class: 'hint' }, 'a-z 0-9 -')), field('project', project), field('ssh key', key)),
     h('div', { class: 'row' }, next('name')));
@@ -141,6 +147,7 @@ export default async function create(ctx) {
     }
   });
   const named = () => want.name && NAME.test(want.name);
+  const keyed = () => KEY.test(want.ssh_key);
   const shapeText = () => `${want.vcpus} vcpu · ${want.memory_gb} gb · ${want.disk_gb} gb`;
   const nodeText = () => (want.placement === 'pin' ? nodes.find((n) => n.id === want.node)?.hostname ?? '—' : want.placement === 'spread' ? `spread · ${want.spread || '—'}` : 'copper picks');
   const SUMMARY = {
@@ -166,8 +173,10 @@ export default async function create(ctx) {
     fill(dryRun, copyBlock('dry run', dryRunLines()));
     fill(summary, kv([['name', want.name || '—'], ['image', want.image], ['arch', want.arch], ['shape', shapeText()], ['project', want.project], admin ? ['node', nodeText()] : null]));
     make.textContent = `create ${want.name || 'vm'} ›`;
-    make.disabled = !(named() && fit?.fits);
-    const verdict = !want.name ? st('stopped', 'name it first') : !named() ? st('failed', 'name: a-z 0-9 -') : !fit ? st('starting', 'checking…')
+    make.disabled = !(named() && keyed() && fit?.fits);
+    const verdict = !want.name ? st('stopped', 'name it first') : !named() ? st('failed', 'name: a-z 0-9 -')
+      : !want.ssh_key ? st('stopped', 'add an ssh key') : !keyed() ? st('failed', 'ssh key: paste a public key, one line')
+      : !fit ? st('starting', 'checking…')
       : fit.fits ? st('running', 'fits') : st('failed', over.vcpus ? `won't fit · ${want.vcpus} > ${L.vcpus} vcpu` : "won't fit");
     fill(bar, verdict, button('cancel', { href: '#/instances' }), make);
   }
@@ -238,7 +247,7 @@ export default async function create(ctx) {
     return {
       name: named() ? want.name : check ? 'vm' : want.name,
       vcpus: want.vcpus, memory_mb: want.memory_gb * 1024, arch: want.arch, image: want.image, disk_gb: want.disk_gb,
-      ssh_keys: want.ssh_key ? [want.ssh_key] : [],
+      ssh_keys: keyed() ? [want.ssh_key] : [],
       node: admin && want.placement === 'pin' && want.node ? want.node : undefined,
       spread: admin && want.placement === 'spread' && want.spread ? want.spread : undefined,
     };

@@ -148,6 +148,7 @@ fn spec_for(conn: &rusqlite::Connection, state: &AppState, auth: &Auth, req: &Cr
     if let Some(group) = &req.spread {
         validate_name(group)?;
     }
+    validate_ssh_keys(&req.ssh_keys)?;
     if let Some(node) = req.node {
         db::node(conn, node)?.ok_or_else(|| Error::not_found("node"))?;
     }
@@ -165,7 +166,24 @@ fn spec_for(conn: &rusqlite::Connection, state: &AppState, auth: &Auth, req: &Cr
     })
 }
 
-/// The dry run behind the console's "won't fit" panel.
+/// Keys as `ssh-keygen` writes them to `~/.ssh/id_*.pub`: one line, a key
+/// type, then base64. Anything else, a private key above all, never reaches
+/// a node.
+fn validate_ssh_keys(keys: &[String]) -> Result<()> {
+    let public = |k: &str| {
+        let mut parts = k.split_whitespace();
+        let (Some(kind), Some(blob)) = (parts.next(), parts.next()) else { return false };
+        let known = ["ssh-", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-"].iter().any(|p| kind.starts_with(p));
+        !k.contains(['\n', '\r']) && known && blob.len() >= 16 && blob.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+    };
+    match keys.iter().find(|k| !public(k)) {
+        Some(_) => Err(Error::bad_request("ssh keys must be OpenSSH public keys, one line each, like ~/.ssh/id_ed25519.pub")),
+        None => Ok(()),
+    }
+}
+
+/// The dry run behind the console's "won't fit" panel. It needs no ssh key,
+/// so the console can check a shape before one is pasted.
 async fn check_instance(State(state): State<AppState>, auth: Auth, Path(project): Path<String>, Json(req): Json<CreateInstance>) -> Result<Json<FitCheck>> {
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
@@ -178,6 +196,11 @@ async fn create_instance(State(state): State<AppState>, auth: Auth, Path(project
     let conn = state.db.lock().unwrap();
     let p = self::project(&conn, &auth, &project)?;
     let spec = spec_for(&conn, &state, &auth, &req)?;
+    // Keys are only written at first boot and the images have no password, so
+    // a VM made without one could never be logged into.
+    if spec.ssh_keys.is_empty() {
+        return Err(Error::bad_request("a vm needs at least one ssh key; without one nobody can ever log in"));
+    }
     if db::instance_by_name(&conn, p.project.id, &req.name)?.is_some() {
         return Err(Error::conflict("instance already exists"));
     }

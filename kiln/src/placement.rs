@@ -136,6 +136,19 @@ pub fn check(conn: &Connection, project: &db::Project, spec: &InstanceSpec, hint
         }
         nodes.push(NodeFit { node: node.id, hostname: node.hostname.clone(), status: node.public_status(), fits: eligible && fits(&free, spec), free });
     }
+    // The project's caps bound it too, so a size taken from `largest` is one
+    // kiln would accept.
+    let used = project_usage(conn, project.id)?;
+    let caps = &project.quota;
+    if let Some(cap) = caps.vcpus {
+        largest.vcpus = largest.vcpus.min(cap.saturating_sub(used.vcpus));
+    }
+    if let Some(cap) = caps.memory_mb {
+        largest.memory_mb = largest.memory_mb.min(cap.saturating_sub(used.memory_mb));
+    }
+    if let Some(cap) = caps.disk_gb {
+        largest.disk_gb = largest.disk_gb.min(cap.saturating_sub(used.disk_gb));
+    }
     let reason = if let Some(r) = quota_refusal(conn, project, spec, None)? {
         Some(r)
     } else if !nodes.iter().any(|n| n.status == NodeStatus::Online) {

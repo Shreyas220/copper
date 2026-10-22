@@ -349,6 +349,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Create { name, vcpus, memory, image, disk, arch, ssh_keys, node, spread } => {
             let arch: Arch = serde_json::from_value(serde_json::Value::String(arch)).context("arch must be x86_64 or aarch64")?;
             let ssh_keys = resolve_ssh_keys(ssh_keys)?;
+            if ssh_keys.is_empty() {
+                bail!("no ssh key in ~/.ssh/*.pub; make one with ssh-keygen or pass --ssh-key");
+            }
             let body = serde_json::to_value(CreateInstance { name, vcpus, memory_mb: memory, arch, image, disk_gb: disk, ssh_keys, node, spread })?;
             let i: Instance = c.call(Method::POST, &format!("/v1/projects/{p}/instances"), Some(body)).await?;
             print_instance(&i);

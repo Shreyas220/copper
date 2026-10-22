@@ -24,6 +24,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 rand = "0.9"
 argon2 = "0.5"
+libc = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # HTTP upgrades for the `cu ssh` tunnel; the same versions axum already uses.
 hyper = "1"

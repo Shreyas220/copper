@@ -115,4 +115,5 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 ## Console
 - Kiln serves the console from files built into the binary (`kiln/ui`, embedded by `build.rs`). It is plain JavaScript modules with no build step, and a plain client of the same API cu uses.
 - Every element shows something kiln returns or does something kiln does. There are no placeholders for unbuilt features.
+- The halftone artwork (`kiln/ui/art`) follows the same rule. A node is drawn by role: copper for the machine kiln runs on (its hostname matches `GET /v1/info`), bronze for other online nodes, grey for offline, a dotted outline for waiting. A stack drawing is used only when its pictured roles match the nodes exactly; otherwise each node gets its own slab.
 - Pages build the DOM with a helper that only ever sets text, so names and messages from the API can't inject markup. The content security policy allows scripts, styles and fonts only from kiln itself.

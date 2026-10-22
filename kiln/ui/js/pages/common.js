@@ -3,7 +3,7 @@
 
 import { enc, get, post } from '../api.js';
 import { h } from '../dom.js';
-import { since, shape } from '../format.js';
+import { shape, since } from '../format.js';
 import { createProject, isAdmin, session } from '../session.js';
 import { button, field, input, notice, stateBadge, table, toast } from '../ui.js';
 
@@ -14,8 +14,9 @@ export async function listInstances() {
   return session.project ? get(projectUrl('/instances')) : [];
 }
 
-/** Sorted by state, then name, like `cu ls`. */
-export function instanceTable(instances) {
+/** Sorted by state, then name, like `cu ls`. With `onChange`, each row also
+ *  gets the action its state allows. */
+export function instanceTable(instances, onChange) {
   const order = ['failed', 'unknown', 'starting', 'stopping', 'deleting', 'running', 'stopped'];
   const rows = [...instances].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state) || a.name.localeCompare(b.name));
   return table([
@@ -26,7 +27,40 @@ export function instanceTable(instances) {
     { title: 'image', cell: (i) => i.image, class: 'hide-sm' },
     { title: 'address', cell: (i) => i.addresses[0] ?? '—' },
     { title: 'up', cell: (i) => (i.running_since ? since(i.running_since) : '—') },
+    onChange ? { title: '', cell: (i) => rowAction(i, onChange) } : null,
   ].filter(Boolean), rows, (i) => (location.hash = `#/instances/${enc(i.name)}`));
+}
+
+/** The one thing kiln lets you do from here in each state. */
+function rowAction(i, onChange) {
+  const run = (text, fn) => {
+    const btn = button(text, { small: true });
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      try {
+        await fn((t) => (btn.textContent = t));
+        onChange();
+      } catch (err) {
+        toast(err.message, true);
+        btn.disabled = false;
+      }
+    });
+    return btn;
+  };
+  switch (i.state) {
+    case 'running':
+    case 'starting':
+      return run('stop', () => post(instanceUrl(i.name, '/stop')));
+    case 'stopped':
+      return run('start', () => post(instanceUrl(i.name, '/start')));
+    case 'failed':
+      return run('stop + start', (progress) => stopThenStart(i.name, progress));
+    case 'unknown':
+      return button('look ›', { small: true, href: `#/instances/${enc(i.name)}` });
+    default:
+      return null;
+  }
 }
 
 /** A failed start stops retrying after five minutes. Stopping, then starting,

@@ -79,6 +79,9 @@ main { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; }
 .cells.two { grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); }
 .cells.four { grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); }
 .cells.two > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+.cells.two.cards > :last-child { grid-column: auto; }
+@media (max-width: 960px) { .cells.two.cards > [aria-hidden="true"]:last-child { display: none; } }
+.cells.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cells.split { grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); }
 @media (max-width: 760px) { .cells.split { grid-template-columns: 1fr; } }
 .footer { margin-top: auto; padding: 28px; border-top: 1px solid var(--l2); display: flex; justify-content: space-between; font: 500 10px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--fg4); }
@@ -117,6 +120,10 @@ main { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; }
 .choice[aria-pressed="true"] { border-color: var(--cu); color: var(--fg); background: var(--warm); }
 .choice:disabled { border-style: dashed; cursor: not-allowed; opacity: .6; }
 
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border: 1px solid var(--l3); background: none; cursor: pointer; font: 500 10.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--fg3); }
+.chip span { color: var(--fg4); }
+.chip[aria-pressed="true"] { border-color: var(--cu); color: var(--fg); background: var(--warm); }
 .tag { display: inline-flex; align-items: center; flex: none; height: 18px; padding: 0 6px; border: 1px dashed rgba(142, 139, 132, .5); font: 500 9px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--fg3); white-space: nowrap; }
 .tag.warm { border-color: rgba(217, 160, 110, .55); color: var(--cu2); }
 .tag.pat { border: 1px solid rgba(79, 181, 156, .45); color: var(--pat); }
@@ -190,14 +197,62 @@ table.list tr.link:hover td { background: var(--p1); color: var(--fg); }
 .spark polyline { fill: none; stroke: var(--cu); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .spark .area { fill: rgba(232, 145, 92, .08); stroke: none; }
 
-/* the node stack, drawn with type and borders like the site's FIG.0 */
-.slabs { display: flex; flex-direction: column; gap: 10px; padding: 8px 0; }
-.slab { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 12px; height: 52px; padding: 0 16px; border: 1px solid var(--l3); background-color: var(--p2); background-image: radial-gradient(circle, rgba(237,233,226,.05) 0 1px, transparent 1.3px); background-size: 6px 6px; text-decoration: none; }
-.slab.online { border-color: rgba(232, 145, 92, .5); background-color: #17110D; }
-.slab.pending { border-style: dashed; border-color: rgba(79, 181, 156, .6); }
-.slab.offline, .slab.retired { opacity: .55; }
-.slab .name { font: 500 12px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
-.slab .what { font: 400 11px/1 var(--mono); color: var(--fg3); }
+/* ---- artwork: the design's halftone drawings, with callouts ---------------- */
+
+.art { display: block; width: 100%; height: auto; }
+.scene-wrap { position: relative; }
+.scene.bleed { margin: 0 -28px; }
+/* instance header: text left, its machine right */
+.split-head { display: flex; flex-wrap: wrap; }
+.split-head > .head { flex: 1 1 460px; min-width: 0; }
+.machine { flex: 1 1 440px; min-width: 0; align-self: center; }
+.machine .drop { position: absolute; left: 24%; top: 54%; width: 1px; height: 17%; background: rgba(237, 233, 226, .35); }
+.machine .drop::after { content: ""; position: absolute; left: -1.5px; bottom: -2px; width: 4px; height: 4px; background: rgba(237, 233, 226, .8); }
+.machine .drop-box { position: absolute; left: calc(24% - 10px); top: calc(71% + 10px); }
+.machine figcaption { position: absolute; right: 28px; top: 20px; }
+.node-name { margin: 0; display: flex; align-items: baseline; gap: 10px; font: 400 22px/1.2 var(--sans); }
+.node-name .mono { font-size: 13px; }
+.facts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.facts li { display: grid; grid-template-columns: 30px 1fr; gap: 6px; font: 400 14px/1.45 var(--sans); color: var(--fg2); }
+.facts li .mono { font-size: 11px; line-height: 1.9; color: var(--fg4); }
+.scene-wrap .fig0 { position: absolute; right: 28px; bottom: 22px; }
+.scene { position: relative; margin: 0; overflow: hidden; }
+.scene figcaption { position: absolute; right: 28px; bottom: 22px; }
+.slab-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); }
+.callout { position: absolute; transform: translateY(-50%); display: flex; align-items: center; text-decoration: none; }
+.callout.flip { flex-direction: row-reverse; }
+.callout.center { transform: translate(-50%, -50%); }
+.callout.center .leader, .callout.center .pin { display: none; }
+.callout .leader { width: 34px; height: 1px; background: rgba(237, 233, 226, .35); }
+.callout .pin { width: 4px; height: 4px; margin: 0 6px; background: rgba(237, 233, 226, .8); }
+.tagbox { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; background: rgba(10, 13, 12, .66); border: 1px solid rgba(237, 233, 226, .14); font: 500 10.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--fg); white-space: nowrap; }
+.tagbox small { font-size: 10.5px; color: var(--fg2); text-transform: none; letter-spacing: .02em; }
+.callout:hover .tagbox { border-color: var(--cu); }
+.light { position: absolute; width: 8px; height: 8px; transform: translate(-50%, -50%); background: var(--cu); }
+.legend { display: none; flex-direction: column; padding: 0 28px 24px; }
+.legend a { display: flex; align-items: center; gap: 10px; min-height: 44px; border-bottom: 1px solid var(--l1); text-decoration: none; font: 500 11px/1.3 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.legend a span:last-child { margin-left: auto; color: var(--fg3); text-transform: none; letter-spacing: 0; }
+@media (max-width: 760px) { .callout { display: none; } .legend { display: flex; } }
+
+/* FIG.1: kiln and its ingots */
+.wire { position: relative; border: 1px dashed var(--l3); padding: 36px 16px 20px; }
+.wire > .label { position: absolute; top: -6px; left: 14px; padding: 0 6px; background: var(--bg); }
+.wire .kiln { display: flex; justify-content: center; }
+.wire .box { display: inline-flex; align-items: center; gap: 10px; padding: 12px 16px; background: var(--p2); border: 1px solid var(--l4); font: 500 14px/1 var(--mono); }
+.wire .box small { font: 400 11px/1 var(--mono); color: var(--fg4); }
+.wire .trunk { position: relative; height: 56px; }
+.wire .trunk::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--l3); }
+.wire .packet { position: absolute; left: calc(50% - 2px); width: 5px; height: 5px; background: var(--cu); animation: packet 2.4s linear infinite; }
+@keyframes packet { 0% { top: 0; opacity: 0 } 12% { opacity: 1 } 88% { opacity: 1 } 100% { top: calc(100% - 5px); opacity: 0 } }
+@media (prefers-reduced-motion: reduce) { .wire .packet { animation: none; } }
+.wire .ingots { position: relative; display: grid; gap: 10px; }
+.wire .ingots::before { content: ""; position: absolute; top: 0; height: 1px; background: var(--l3); left: var(--edge); right: var(--edge); }
+.wire .ingot { display: flex; flex-direction: column; min-width: 0; text-decoration: none; }
+.wire .ingot::before { content: ""; align-self: center; width: 1px; height: 16px; background: var(--l3); }
+.wire .ingot > div { padding: 10px; background: var(--p1); border: 1px solid var(--l3); display: flex; flex-direction: column; gap: 7px; font: 500 13px/1 var(--mono); }
+.wire .ingot.offline > div { border-style: dashed; color: var(--fg3); }
+.wire .ingot.pending > div { border-style: dashed; border-color: rgba(232, 145, 92, .6); }
+.wire .ingot small { font: 400 11px/1.4 var(--mono); color: var(--fg4); overflow-wrap: anywhere; }
 
 #console-term { height: 460px; padding: 10px; background: #070908; border: 1px solid var(--l2); }
 #console-term .xterm-viewport { background-color: #070908 !important; scrollbar-color: var(--l3) #070908; scrollbar-width: thin; }
@@ -207,9 +262,10 @@ table.list tr.link:hover td { background: var(--p1); color: var(--fg); }
 /* sign-in and invite pages */
 .door { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 16px; }
 .door .card { width: 100%; max-width: 1120px; border: 1px solid var(--l2); display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); }
-.door .art { min-height: 380px; border-right: 1px solid var(--l2); position: relative; overflow: hidden; background-color: #0C0B0A; }
-.door .art::before { content: ""; position: absolute; inset: 0; background-image: radial-gradient(circle, #F6C39C 0 1.6px, transparent 2.1px); background-size: 9px 9px; -webkit-mask-image: radial-gradient(ellipse at 50% 45%, #000 0 18%, transparent 46%); mask-image: radial-gradient(ellipse at 50% 45%, #000 0 18%, transparent 46%); }
-.door .art::after { content: ""; position: absolute; left: 22%; right: 22%; top: 52%; height: 26px; border: 1px solid rgba(232,145,92,.6); background: #17110D; }
-.door .art span { position: absolute; left: 24px; bottom: 22px; }
+.door-art { position: relative; margin: 0; min-height: 420px; border-right: 1px solid var(--l2); overflow: hidden; }
+.door-art { background: #0B0D0C; }
+.door-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+  -webkit-mask-image: radial-gradient(ellipse 50% 40% at center, #000 60%, transparent 100%); mask-image: radial-gradient(ellipse 50% 40% at center, #000 60%, transparent 100%); }
+.door-art figcaption { position: absolute; left: 24px; bottom: 22px; }
 .door form { padding: 56px 40px; display: flex; flex-direction: column; gap: 20px; max-width: 460px; justify-self: center; width: 100%; }
 .door .where { margin-top: 20px; }

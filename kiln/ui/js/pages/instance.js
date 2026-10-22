@@ -1,21 +1,24 @@
 import { del, enc, get, post } from '../api.js';
+import { role, slab } from '../art.js';
 import { fill, h } from '../dom.js';
 import { ago, bytes, percent, shape, since } from '../format.js';
 import { isAdmin, session } from '../session.js';
-import { act, button, copyBlock, empty, field, input, kv, label, notice, spark, stateBadge, subtitle, title, toast } from '../ui.js';
+import { act, button, copyBlock, dot, empty, field, input, kv, label, notice, spark, stateBadge, subtitle, title, toast } from '../ui.js';
 import { instanceUrl, stopThenStart } from './common.js';
 
 const TABS = ['overview', 'history', 'console', 'metrics'];
 
 export default async function instance(ctx, name) {
   let inst = await get(instanceUrl(name));
+  // Admins get the node record too, to draw the machine the VM is on.
+  let nodes = isAdmin() ? await get('/v1/nodes') : [];
   let tab = 'overview';
   let leaveTab = () => {};
-  const header = h('div');
+  const header = h('div', { class: 'split-head' });
   const tabs = h('div', { class: 'tabs', role: 'tablist' });
   const body = h('div');
 
-  const drawHeader = () => fill(header, heading(inst, refresh));
+  const drawHeader = () => fill(header, heading(inst, refresh), machine(inst, nodes.find((n) => n.id === inst.node)));
   const drawTabs = () => fill(tabs, TABS.map((t) => h('button', {
     type: 'button', role: 'tab', 'aria-selected': t === tab ? 'true' : 'false', onclick: () => open(t),
   }, t)));
@@ -31,6 +34,7 @@ export default async function instance(ctx, name) {
   async function refresh() {
     try {
       inst = await get(instanceUrl(name));
+      if (isAdmin()) nodes = await get('/v1/nodes');
     } catch (e) {
       if (e.status === 404) {
         toast(`${name} is gone`);
@@ -77,6 +81,16 @@ function heading(inst, refresh) {
       button('connect ›', { primary: true, onclick: () => document.getElementById('connect')?.scrollIntoView({ behavior: 'smooth' }) }),
       toggle,
       button('delete', { danger: true, onclick: () => document.getElementById('delete')?.scrollIntoView({ behavior: 'smooth' }) })));
+}
+
+/** FIG.0: the node this VM runs on, with the VM's callout. Admin only. */
+function machine(inst, node) {
+  if (!node || !role(node)) return null;
+  return h('figure', { class: 'scene machine' },
+    slab(node),
+    h('span', { class: 'drop', 'aria-hidden': 'true' }),
+    h('span', { class: 'tagbox drop-box' }, dot(inst.state), inst.name, h('small', {}, shape(inst))),
+    h('figcaption', { class: 'label' }, 'FIG.0 ', h('a', { href: '#/nodes', style: { color: 'var(--fg2)' } }, node.hostname)));
 }
 
 async function change(btn, inst, what, refresh) {

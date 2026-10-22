@@ -11,9 +11,9 @@ use crate::AppState;
 
 include!(concat!(env!("OUT_DIR"), "/ui_files.rs"));
 
-/// Scripts, styles and fonts only from kiln itself; no inline script, no
-/// framing. WebSockets for the serial console count as `'self'`.
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; \
+/// Scripts, styles, fonts and images only from kiln itself; no inline
+/// script, no framing. WebSockets for the serial console count as `'self'`.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; \
                    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 pub fn router() -> Router<AppState> {

@@ -1,11 +1,13 @@
 import { enc, get } from '../api.js';
+import { stack, nodeNote } from '../art.js';
 import { fill, h } from '../dom.js';
 import { ago, BUSY, gb, NEEDS_LOOK, plural } from '../format.js';
 import { currentProject, isAdmin, session } from '../session.js';
 import { button, dot, empty, fig, meter, subtitle, title } from '../ui.js';
 import { firstProject, instanceTable, listInstances, stopThenStart } from './common.js';
 
-/** Overview: how many are running, what needs a look, and every instance. */
+/** Overview: the machines, what's running, what needs a look, and every
+ *  instance in the project. Machines are admin-only, as kiln sends them. */
 export default async function overview(ctx) {
   if (!session.project) return firstProject();
   const root = h('div', { style: { display: 'contents' } });
@@ -25,21 +27,24 @@ async function sections() {
   const count = (pred) => instances.filter((i) => pred(i.state)).length;
   const running = count((s) => s === 'running');
   const look = instances.filter((i) => NEEDS_LOOK.has(i.state));
-  const pending = (nodes ?? []).filter((n) => n.status === 'pending');
-  const headline = instances.length
-    ? `${running} running${look.length + pending.length ? `, ${look.length + pending.length} need a look` : ''}.`
+  const live = (nodes ?? []).filter((n) => n.status !== 'retired');
+  const pending = live.filter((n) => n.status === 'pending');
+  const attention = look.length + pending.length;
+  const headline = instances.length || live.length
+    ? `${running} running${attention ? `, ${attention} need${attention === 1 ? 's' : ''} a look` : ''}.`
     : 'Nothing here yet.';
   const here = currentProject();
   const quota = quotas.find((q) => q.owner === here.owner && q.project === here.name);
   return [
     h('section', {}, h('div', { class: 'head' }, title('Overview.', headline))),
+    live.length ? h('section', {}, h('div', { class: 'scene-wrap' }, stack(live), h('span', { class: 'label fig0' }, 'FIG.0'))) : null,
     h('section', {}, h('div', { class: 'cells four' },
       stat('running', running, 'running'),
       stat('busy', count((s) => BUSY.has(s)), 'starting', true),
-      stat('need a look', look.length + pending.length, 'failed'),
+      stat('need a look', attention, 'failed'),
       quotaCell(quota))),
     h('section', {}, h('div', { class: 'cells two' },
-      nodes ? h('div', { class: 'pad stack' }, fig(1, 'your cloud'), cloudFigure(nodes)) : null,
+      nodes ? h('div', { class: 'pad stack' }, fig(1, 'your cloud'), wiring(live)) : null,
       h('div', { class: 'pad stack' }, fig(nodes ? 2 : 1, 'needs a look'), needsLook(look, pending, events)))),
     h('section', {},
       h('div', { class: 'head' }, h('div', { class: 'row spread' },
@@ -66,23 +71,28 @@ function quotaCell(q) {
   return box;
 }
 
-/** One slab per machine, as on the site. Only admins get machines from kiln. */
-function cloudFigure(nodes) {
+/** FIG.1: kiln at the address this page came from, and an ingot per node. */
+function wiring(nodes) {
   if (!nodes.length) return empty('no machines have registered yet.');
-  return h('div', { class: 'slabs' }, nodes.filter((n) => n.status !== 'retired').map((n, i) => h('a', { class: `slab ${n.status}`, href: '#/nodes' },
-    dot(n.status, n.status === 'pending'),
-    h('span', { class: 'name' }, `${String(i + 1).padStart(2, '0')} ${n.hostname}`),
-    h('span', { class: 'what' }, n.status === 'online' ? plural(n.instances.length, 'vm') : n.status === 'pending' ? 'wants in' : `quiet ${ago(n.last_seen)}`))));
+  const cols = Math.min(nodes.length, 4);
+  return h('div', { class: 'wire' },
+    h('span', { class: 'label' }, location.host),
+    h('div', { class: 'kiln' }, h('span', { class: 'box' }, dot('starting'), 'kiln', h('small', {}, session.kiln?.hostname ?? ''))),
+    h('div', { class: 'trunk', 'aria-hidden': 'true' }, h('span', { class: 'packet' })),
+    h('div', { class: 'ingots', style: { gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, '--edge': `calc(${50 / cols}% - 5px)` } },
+      nodes.map((n) => h('a', { class: `ingot ${n.status}`, href: '#/nodes' },
+        h('div', {}, h('span', { class: 'row', style: { gap: '7px' } }, dot(n.status, n.status === 'pending'), 'ingot'),
+          h('small', {}, n.hostname, h('br'), nodeNote(n)))))));
 }
 
 /** Failed and unknown instances and waiting nodes, with what to do next. */
 function needsLook(look, pending, events) {
   const rows = [];
   for (const n of pending) {
-    rows.push(item(ago(null), n.hostname, `wants in · key ${n.fingerprint ?? '—'}`, button('let it in ›', { small: true, href: '#/nodes' })));
+    rows.push(item('—', n.hostname, `wants in · key ${n.fingerprint ?? '—'}`, button('let it in ›', { small: true, href: '#/nodes' })));
   }
   for (const i of look) {
-    const why = events.find((e) => e.instance === i.name && (e.kind === 'failed' || e.kind === 'node quiet'));
+    const why = events.find((e) => e.instance === i.name && e.kind === 'failed');
     if (i.state === 'failed') {
       const btn = button('stop + start', { small: true });
       btn.addEventListener('click', async () => {
@@ -94,8 +104,7 @@ function needsLook(look, pending, events) {
       rows.push(item('—', i.name, 'unknown · its node is not reporting', button('look ›', { small: true, href: `#/instances/${enc(i.name)}` })));
     }
   }
-  if (!rows.length) return empty('nothing needs a look.');
-  return h('div', {}, rows);
+  return rows.length ? h('div', {}, rows) : empty('nothing needs a look.');
 }
 
 function item(when, name, what, action) {

@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 use crate::node::{Capacity, NodeId, Usage};
 use crate::user::NodeStatus;
 
+/// About the kiln answering. `hostname` matches the node record of the
+/// machine kiln runs on, if that machine is also a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KilnInfo {
+    pub hostname: String,
+    pub version: String,
+}
+
 /// One line of the event log, newest first when listed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {

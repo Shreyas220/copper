@@ -4,6 +4,8 @@ import { get, post } from './api.js';
 
 export const session = {
   me: null,
+  /** `{ hostname, version }` of the kiln answering. */
+  kiln: null,
   /** [{ name, owner }] as kiln lists them. */
   projects: [],
   /** Path of the current project: `name`, or `owner:name` for someone else's. */
@@ -26,6 +28,7 @@ export function currentProject() {
 
 export async function loadSession() {
   session.me = await get('/v1/me');
+  session.kiln = await get('/v1/info');
   await loadProjects();
 }
 

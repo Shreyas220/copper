@@ -8,7 +8,9 @@ import { button, field, input, notice } from '../ui.js';
 export function door(form) {
   return h('div', { class: 'door' },
     h('div', { class: 'card' },
-      h('div', { class: 'art', 'aria-hidden': 'true' }, h('span', { class: 'label' }, 'FIG.0 · copper')),
+      h('figure', { class: 'door-art' },
+        h('img', { src: '/ui/art/stack-1.png', alt: 'halftone drawing of a single copper slab lit from behind, floating above still water' }),
+        h('figcaption', { class: 'label' }, 'FIG.0 · copper')),
       form),
     h('p', { class: 'label where' }, location.host));
 }

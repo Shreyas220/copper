@@ -15,11 +15,26 @@ use crate::{placement, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/v1/info", get(info))
         .route("/v1/images", get(list_images))
         .route("/v1/events", get(list_events))
         .route("/v1/projects/{project}/instances/{name}/metrics", get(instance_metrics))
         .route("/v1/quotas", get(list_quotas))
         .route("/v1/projects/{project}/quota", put(set_quota))
+}
+
+async fn info(_auth: Auth) -> Json<KilnInfo> {
+    Json(KilnInfo { hostname: hostname(), version: env!("CARGO_PKG_VERSION").to_string() })
+}
+
+/// The short hostname, as ingot reports it for its node.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).split('.').next().unwrap_or_default().to_string()
 }
 
 async fn list_images(State(state): State<AppState>, _auth: Auth) -> Result<Json<Vec<Image>>> {

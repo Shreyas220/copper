@@ -32,7 +32,11 @@ function setProps(el, props) {
     } else if (key === 'class') {
       el.className = value;
     } else if (key === 'style' && typeof value === 'object') {
-      Object.assign(el.style, value);
+      // setProperty also handles custom properties like `--edge`.
+      for (const [prop, v] of Object.entries(value)) {
+        if (prop.startsWith('--')) el.style.setProperty(prop, v);
+        else el.style[prop] = v;
+      }
     } else if (key === 'value' && 'value' in el) {
       el.value = value;
     } else if (value === true) {

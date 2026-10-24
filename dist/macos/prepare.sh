@@ -164,8 +164,16 @@ if ! cmp -s "$STATE/bin/ingot" "$helper" || [ ! -f "$daemon" ]; then
 </dict>
 </plist>
 EOF
-  sudo launchctl bootout system/com.copper.net 2>/dev/null || true
-  sudo launchctl bootstrap system "$daemon"
+  # A loaded daemon restarts on the new binary; launchctl's bootstrap can
+  # report an error even as it loads one, so what counts is that it runs.
+  if sudo launchctl print system/com.copper.net >/dev/null 2>&1; then
+    sudo launchctl kickstart -k system/com.copper.net
+  else
+    sudo launchctl bootstrap system "$daemon" 2>/dev/null || true
+  fi
+  sleep 2
+  sudo launchctl print system/com.copper.net 2>/dev/null | grep -q "state = running" \
+    || die "the network helper didn't start; see /var/log/copper-net.log"
 fi
 
 # launchd has no equivalent of systemd's RestartPreventExitStatus, so a wrapper

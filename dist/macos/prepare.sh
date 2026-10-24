@@ -208,10 +208,21 @@ cat > "$plist" <<EOF
 </plist>
 EOF
 # Restarting ingot leaves VMs running: each one is its own LaunchAgent.
-launchctl bootout "gui/$(id -u)/com.copper.ingot" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$plist"
+# ingot and the VMs live in $USER's login session, which exists only while
+# $USER is logged in on the Mac's screen (or through Screen Sharing).
+if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/com.copper.ingot" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  started=yes
+else
+  started=no
+fi
 
 say "done; ingot $("$STATE/bin/ingot" --version | awk '{print $2}') talks to $KILN"
+[ $started = yes ] || cat <<EOF
+$USER isn't logged in on the Mac's screen, so ingot isn't running yet.
+It starts at the next login: log in at the Mac, or through Screen Sharing.
+EOF
 cat <<EOF
 ingot runs as a LaunchAgent for $USER and starts at login.
   log:      tail -f $STATE/ingot.log   (network helper: /var/log/copper-net.log)

@@ -21,11 +21,11 @@ One architecture wherever a node is: on the home router or anywhere on the tailn
 - [x] `copper-net.service`: NAT to the internet, nothing private, nothing on the node but DNS. Tested in network namespaces in CI.
 - [x] Reach VMs through their node: `cu ssh`, `cu forward <vm> <port>` and the serial console, with kiln never connecting to a node or a VM.
 - [x] Kiln on the tailnet and loopback only.
-- [ ] Every VM packet goes through its host: `/32` addresses with an on-link gateway, isolated bridge ports, MTU 1220.
-- [ ] Projects are walls: VMs only reach VMs in their own project.
-- [ ] Names: `<vm>.<project>.copper` from ingot's DNS on each gateway, per project.
-- [ ] A root helper (`ingot net`) applies each node's network from a file ingot writes, replacing the `copper-net` script.
-- [ ] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path.
+- [x] Every VM packet goes through its host: `/32` addresses with an on-link gateway, isolated bridge ports, MTU 1220.
+- [x] Projects are walls: VMs only reach VMs in their own project.
+- [x] Names: `<vm>.<project>.copper` from ingot's DNS on each gateway, per project.
+- [x] A root helper (`ingot net`) applies each node's network from a file ingot writes, replacing the `copper-net` script.
+- [x] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path. Tested with three nodes in namespaces in CI; on real nodes once a second Linux node or the Mac mini joins.
 - [ ] Tart nodes on copper networks: the Mac's VM network on the node's /24, pf rules, private ports, `wireguard-go`. Tested by hand on the Mac mini first.
 - [ ] A jump host in kiln, so plain `ssh` reaches a VM by name without cu.
 

@@ -16,7 +16,6 @@ mod net;
 mod reconcile;
 mod sessions;
 mod state;
-mod tailnet;
 #[cfg(any(target_os = "macos", feature = "tart"))]
 mod tart;
 #[cfg(test)]

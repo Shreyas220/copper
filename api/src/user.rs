@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::node::{Arch, Capacity, DesiredState, InstanceId, NodeId, ObservedState, Usage};
+use crate::node::{Arch, Capacity, DesiredState, InstanceId, NodeId, ObservedState, Usage, Via};
 
 /// Instance state as the user sees it. Derived from (desired, observed, node online),
 /// never stored. See docs/design.md for the table.
@@ -80,10 +80,6 @@ pub struct Instance {
     /// log in, and only recreating it changes that.
     #[serde(default)]
     pub ssh_keys: Vec<InstanceKey>,
-    /// Tailnet devices can reach its address directly: it's on a copper
-    /// network whose node advertises the subnet route.
-    #[serde(default)]
-    pub tailnet: bool,
 }
 
 /// A key a VM was made with: enough to recognise it, not the key itself.
@@ -202,8 +198,19 @@ pub struct Node {
     /// As the node last reported; see `ObservedNodeState`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_ready: Option<bool>,
+    /// How it reaches each other node in the mesh, as it last reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<NodePeer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodePeer {
+    pub hostname: String,
+    /// `None` while no handshake has completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tailnet_route: Option<bool>,
+    pub via: Option<Via>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_age_s: Option<u64>,
 }
 
 /// A base image in kiln's catalogue.

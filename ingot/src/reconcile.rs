@@ -15,7 +15,6 @@ use copper_api::*;
 
 use crate::hv::{DomState, Hypervisor};
 use crate::images::Images;
-use crate::tailnet::RouteCheck;
 
 const FAIL_BUDGET: Duration = Duration::from_secs(5 * 60);
 const RETRY_EVERY: Duration = Duration::from_secs(10);
@@ -53,7 +52,6 @@ pub struct Reconciler<H = crate::hv::Native> {
     configured: HashMap<InstanceId, (u32, u64, u64)>,
     /// The copper network error last logged, so a lasting one is logged once.
     network_error: Option<String>,
-    routes: RouteCheck,
 }
 
 impl<H: Hypervisor> Reconciler<H> {
@@ -68,7 +66,6 @@ impl<H: Hypervisor> Reconciler<H> {
             waiting: HashMap::new(),
             configured: HashMap::new(),
             network_error: None,
-            routes: RouteCheck::default(),
         }
     }
 
@@ -249,14 +246,12 @@ impl<H: Hypervisor> Reconciler<H> {
             let usage = if running { self.hv.usage(id) } else { None };
             ObservedInstance { id, state, error, addresses, usage }
         }).collect();
-        let tailnet_route = self.desired.network.as_ref().filter(|_| self.hv.copper_network()).and_then(|n| self.routes.live(&n.subnet));
         ObservedNodeState {
             generation_seen: self.desired.generation,
             instances,
             capacity: self.capacity(),
             usage: self.hv.host_usage(),
             network_ready: self.hv.network_ready(),
-            tailnet_route,
             mesh: None,
         }
     }

@@ -1,7 +1,7 @@
 import { enc, get, post } from '../api.js';
 import { byRole, nodeNote, role, slab } from '../art.js';
 import { fill, h } from '../dom.js';
-import { gb, percent, plural } from '../format.js';
+import { ago, gb, percent, plural } from '../format.js';
 import { isAdmin, session } from '../session.js';
 import { act, button, copyBlock, dot, empty, field, fig, input, meter, notice, spark, st, title } from '../ui.js';
 
@@ -93,19 +93,25 @@ function facts(n) {
 }
 
 /** The node's copper subnet, whether its host side (copper-net) is in place,
- *  and whether tailnet devices reach its VMs at their addresses. Nodes that
- *  don't run copper networks (Tart, for now) don't report any of it. */
+ *  and how it reaches each other node in the mesh. Nodes that don't run
+ *  copper networks (Tart, for now) don't report any of it. */
 function network(n) {
   if (!n.subnet || n.network_ready === undefined) return null;
   return h('div', { class: 'ocbox' },
     h('div', { class: 'vals' },
       h('span', { class: 'label' }, 'network'), h('b', {}, n.subnet),
-      n.network_ready ? st('running', 'vms reach the internet') : st('failed', 'vms have no internet'),
-      n.tailnet_route ? st('running', 'on the tailnet') : n.tailnet_route === false ? st('stopped', 'not on the tailnet') : null),
+      n.network_ready ? st('running', 'vms reach the internet') : st('failed', 'vms have no network')),
     n.network_ready ? null : copyBlock("copper-net.service isn't running here", ['$ sudo systemctl start copper-net']),
-    n.tailnet_route === false
-      ? copyBlock('on this node; it replaces any routes it advertises now. then approve it in the tailscale admin console', [`$ sudo tailscale set --advertise-routes=${n.subnet}`])
-      : null);
+    ...(n.peers ?? []).map(peerPath));
+}
+
+/** One line per other node: the path of its last handshake, or none yet. */
+function peerPath(p) {
+  const path = { lan: 'direct on the lan', tailnet: 'over the tailnet' }[p.via];
+  const handshake = p.handshake_age_s === undefined ? '' : ` · handshake ${ago(Math.floor(Date.now() / 1000) - p.handshake_age_s)} ago`;
+  return h('div', { class: 'vals' },
+    h('span', { class: 'label' }, `to ${p.hostname}`),
+    path ? st('running', path + handshake) : st('stopped', 'no handshake yet'));
 }
 
 /** Kiln names them project/name; the current project's go without it. */

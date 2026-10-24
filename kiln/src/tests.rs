@@ -125,9 +125,9 @@ async fn nodes_get_a_subnet_and_vms_a_fixed_address_in_it() {
     let f = Fixture::new();
     f.call("POST", &format!("/v1/nodes/{}/policy", f.node), &f.admin, json!({"cpu_ratio": 4.0, "memory_ratio": 4.0, "disk_ratio": 4.0})).await;
     // A libvirt node says it runs copper networks by reporting on its host side.
-    let report = |ready: bool, route: bool| json!({"generation_seen": f.generation(), "instances": [], "capacity": {"vcpus":1,"memory_mb":1024,"disk_gb":10},
-        "network_ready": ready, "tailnet_route": route});
-    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(false, false)).await.0, StatusCode::OK);
+    let report = |ready: bool| json!({"generation_seen": f.generation(), "instances": [], "capacity": {"vcpus":1,"memory_mb":1024,"disk_gb":10},
+        "network_ready": ready});
+    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(false)).await.0, StatusCode::OK);
     // The fixture's node was approved directly; its first VM gives it a subnet.
     let (_, a) = f.create("a").await;
     let (_, b) = f.create("b").await;
@@ -143,14 +143,11 @@ async fn nodes_get_a_subnet_and_vms_a_fixed_address_in_it() {
     assert_eq!(f.call("POST", "/nodes/register", &token, register).await.0, StatusCode::OK);
     let (_, node) = f.call("POST", &format!("/v1/nodes/{id}/approve"), &f.admin, Value::Null).await;
     assert_eq!(node["subnet"], "10.42.2.0/24");
-    // What the node reports about its network shows on the node, and as
-    // `tailnet` on its VMs once the subnet route is live.
-    assert_eq!(f.call("GET", "/v1/projects/default/instances/a", &f.user, Value::Null).await.1["tailnet"], false);
-    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(true, true)).await.0, StatusCode::OK);
+    // What the node reports about its network shows on the node.
+    assert_eq!(f.call("POST", &format!("/nodes/{}/observed", f.node), &f.secret, report(true)).await.0, StatusCode::OK);
     let (_, nodes) = f.call("GET", "/v1/nodes", &f.admin, Value::Null).await;
     let home = nodes.as_array().unwrap().iter().find(|n| n["id"] == json!(f.node)).unwrap();
-    assert_eq!((home["network_ready"].clone(), home["tailnet_route"].clone()), (json!(true), json!(true)));
-    assert_eq!(f.call("GET", "/v1/projects/default/instances/a", &f.user, Value::Null).await.1["tailnet"], true);
+    assert_eq!(home["network_ready"], json!(true));
 }
 
 #[tokio::test]
@@ -228,6 +225,14 @@ async fn nodes_learn_each_others_keys_and_where_to_reach_them() {
     assert_eq!(peers(a).await, json!(null), "b hasn't reported a key yet, and a isn't its own peer");
     assert_eq!(report(b, &key_b, "192.168.68.113:51820").await, StatusCode::OK);
     assert_eq!(peers(a).await[0]["node"], json!(b));
+    // How a node reaches its peers shows on the Nodes page, by hostname.
+    let path = json!({"generation_seen": generation(a), "instances": [], "capacity": {"vcpus":8,"memory_mb":16384,"disk_gb":200},
+        "mesh": {"public_key": key_a, "endpoints": [{"address": "192.168.68.109:51820", "via": "lan"}, {"address": "100.69.49.52:51820", "via": "tailnet"}],
+                 "peers": [{"node": b, "via": "lan", "handshake_age_s": 3}]}});
+    assert_eq!(f.call("POST", &format!("/nodes/{a}/observed"), &secret(a), path).await.0, StatusCode::OK);
+    let (_, nodes) = f.call("GET", "/v1/nodes", &f.admin, Value::Null).await;
+    let on_a = nodes.as_array().unwrap().iter().find(|n| n["id"] == json!(a)).unwrap();
+    assert_eq!(on_a["peers"], json!([{"hostname": format!("n-{b}"), "via": "lan", "handshake_age_s": 3}]));
     // Moving changes where it can be reached, which wakes its peers; the same
     // report again doesn't.
     let before = generation(b);

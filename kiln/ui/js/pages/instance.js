@@ -194,15 +194,13 @@ async function recreate(inst, progress) {
 function connect(inst) {
   if (inst.state !== 'running') return null;
   const flag = session.project === 'default' ? '' : ` --project ${session.project}`;
-  const address = inst.addresses[0];
-  // Everything goes through kiln and the VM's node, wherever you are; its
-  // address works directly only once the node's subnet route is live.
+  // Everything goes through kiln and the VM's node, wherever you are; the
+  // tailnet has no route to VM addresses.
   const ways = [
     { k: 'cu ssh', v: 'through kiln, from anywhere', lines: [`$ cu${flag} ssh ${inst.name}`] },
     { k: 'ssh-config', v: 'scp, rsync, editors', lines: [`$ cu${flag} ssh-config ${inst.name} >> ~/.ssh/config`, `$ scp FILE ${inst.name}.copper:`] },
     { k: 'cu forward', v: 'one of its ports, on localhost', lines: [`$ cu${flag} forward ${inst.name} 8080`] },
-    inst.tailnet && address ? { k: 'ssh', v: `over the tailnet · ${address}`, lines: [`$ ssh ubuntu@${address}`] } : null,
-  ].filter(Boolean);
+  ];
   let chosen = 0;
   const list = h('div', { class: 'options' });
   const shown = h('div', { class: 'pad' });

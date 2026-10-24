@@ -336,7 +336,6 @@ pub struct NodeRow {
     pub subnet: Option<u8>,
     /// As the node last reported them; see `ObservedNodeState`.
     pub network_ready: Option<bool>,
-    pub tailnet_route: Option<bool>,
     pub mesh: Option<MeshReport>,
 }
 
@@ -353,11 +352,11 @@ impl NodeRow {
             NodeDbStatus::Approved => NodeStatus::Offline,
         }
     }
-    pub fn to_api(&self, allocated: Capacity, instances: Vec<String>, usage: Option<Usage>, subnet: Option<String>) -> Node {
+    pub fn to_api(&self, allocated: Capacity, instances: Vec<String>, usage: Option<Usage>, subnet: Option<String>, peers: Vec<NodePeer>) -> Node {
         Node {
             subnet,
             network_ready: self.network_ready,
-            tailnet_route: self.tailnet_route,
+            peers,
             id: self.id,
             hostname: self.hostname.clone(),
             arch: self.arch,
@@ -389,15 +388,15 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
         quiet: r.get(11)?,
         subnet: r.get(12)?,
         network_ready: r.get(13)?,
-        tailnet_route: r.get(14)?,
         // A report kiln can no longer read is as good as none: the node
         // sends a fresh one every 10 s.
-        mesh: r.get::<_, Option<String>>(15)?.and_then(|s| serde_json::from_str(&s).ok()),
+        mesh: r.get::<_, Option<String>>(14)?.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
+// `tailnet_route` (v6) is no longer read: copper doesn't use Tailscale subnet routes.
 const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio, quiet, \
-                         subnet, network_ready, tailnet_route, mesh_json";
+                         subnet, network_ready, mesh_json";
 
 /// Store what a node reports about its side of the mesh. When its key or
 /// where it can be reached changes, every approved node's peer list
@@ -446,11 +445,8 @@ pub fn ensure_subnet(conn: &Connection, id: NodeId) -> anyhow::Result<u8> {
     Ok(next as u8)
 }
 
-pub fn set_network_reports(conn: &Connection, id: NodeId, network_ready: Option<bool>, tailnet_route: Option<bool>) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE nodes SET network_ready = ?1, tailnet_route = ?2 WHERE id = ?3",
-        params![network_ready, tailnet_route, id.to_string()],
-    )?;
+pub fn set_network_ready(conn: &Connection, id: NodeId, network_ready: Option<bool>) -> rusqlite::Result<()> {
+    conn.execute("UPDATE nodes SET network_ready = ?1 WHERE id = ?2", params![network_ready, id.to_string()])?;
     Ok(())
 }
 

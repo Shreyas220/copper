@@ -29,7 +29,14 @@ pub fn node_api(conn: &rusqlite::Connection, state: &AppState, node: &db::NodeRo
     }
     let usage = state.metrics.latest(Subject::Node(node.id)).filter(|_| node.online());
     let subnet = node.subnet.map(|n| state.vm_net.node(n).subnet);
-    Ok(node.to_api(placement::allocated(instances.iter()), names, usage, subnet))
+    // Only peers still in the mesh; a report may lag a retirement.
+    let mut peers = vec![];
+    for p in node.mesh.iter().flat_map(|m| &m.peers) {
+        if let Some(other) = db::node(conn, p.node)?.filter(|o| o.status == db::NodeDbStatus::Approved) {
+            peers.push(NodePeer { hostname: other.hostname, via: p.via, handshake_age_s: p.handshake_age_s });
+        }
+    }
+    Ok(node.to_api(placement::allocated(instances.iter()), names, usage, subnet, peers))
 }
 
 async fn list_nodes(State(state): State<AppState>, auth: Auth) -> Result<Json<Vec<Node>>> {

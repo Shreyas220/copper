@@ -283,10 +283,6 @@ pub struct ObservedNodeState {
     /// that don't need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_ready: Option<bool>,
-    /// Whether the node's subnet is live as a Tailscale subnet route, so
-    /// tailnet devices reach its VMs directly. `None` without Tailscale.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tailnet_route: Option<bool>,
     /// The node's side of the mesh, once its root helper has a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<MeshReport>,

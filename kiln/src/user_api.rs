@@ -94,7 +94,6 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
     let on_copper_net = node.as_ref().is_some_and(|n| n.network_ready.is_some());
     let assigned = row.spec.nics.iter().find_map(|n| n.address.as_deref()).and_then(|a| a.split('/').next())
         .filter(|_| on_copper_net).map(str::to_string);
-    let tailnet = assigned.is_some() && node.as_ref().is_some_and(|n| n.tailnet_route == Some(true));
     let addresses = match assigned {
         Some(a) => vec![a],
         None => observed.map(|o| o.addresses.clone()).unwrap_or_default(),
@@ -119,7 +118,6 @@ pub fn to_api(conn: &rusqlite::Connection, metrics: &Metrics, row: InstanceRow, 
         running_since: row.running_since.filter(|_| running),
         usage: metrics.latest(Subject::Instance(row.id)).filter(|_| running),
         ssh_keys: row.spec.ssh_keys.iter().map(|k| instance_key(k)).collect(),
-        tailnet,
     })
 }
 

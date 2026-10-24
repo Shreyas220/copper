@@ -155,8 +155,8 @@ async fn observed(
     if let Some(usage) = report.usage {
         state.metrics.record(Subject::Node(id), now, usage);
     }
-    if (report.network_ready, report.tailnet_route) != (node.network_ready, node.tailnet_route) {
-        db::set_network_reports(&tx, id, report.network_ready, report.tailnet_route)?;
+    if report.network_ready != node.network_ready {
+        db::set_network_ready(&tx, id, report.network_ready)?;
     }
     let mesh_changed = match &report.mesh {
         Some(mesh) => {

@@ -177,7 +177,10 @@ impl Libvirt {
             Ok(n) => {
                 let defined = n.get_xml_desc(sys::VIR_NETWORK_XML_INACTIVE).map_err(err)?;
                 if network_outdated(&defined) {
-                    Network::define_xml(&self.conn, &network_xml(net)?).map_err(err).context("updating the copper network")?;
+                    // libvirt only lets a definition replace one with the same UUID.
+                    let uuid = n.get_uuid_string().map_err(err)?;
+                    Network::define_xml(&self.conn, &network_xml(net)?.replacen("<network>", &format!("<network>\n  <uuid>{uuid}</uuid>"), 1))
+                        .map_err(err).context("updating the copper network")?;
                     // A running network only picks the change up when it
                     // restarts, which would cut its VMs off, so restart it
                     // only while none are attached; otherwise at the next boot.

@@ -32,8 +32,9 @@ pub const FILE: &str = "network.json";
 pub const READY_FILE: &str = "/run/copper/net-ready";
 /// The mesh's state, for ingot to report: `mesh::Status`.
 pub const STATUS_FILE: &str = "/run/copper/net-status.json";
-/// Where the node's WireGuard key lives, root's alone.
-const KEY_DIR: &str = "/var/lib/copper-net";
+/// Where the node's WireGuard key lives, root's alone. Under /etc/wireguard
+/// because Ubuntu's AppArmor profile for `wg` lets it read keys nowhere else.
+const KEY_DIR: &str = "/etc/wireguard/copper";
 const DEFAULT_SPACE: &str = "10.42.0.0/16";
 const PRIVATE: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
 const CHECK_EVERY: Duration = Duration::from_secs(2);
@@ -351,7 +352,8 @@ pub fn stop() -> anyhow::Result<()> {
     let paths = Paths::from_env();
     let _ = std::fs::remove_file(&paths.ready);
     let _ = std::fs::remove_file(&paths.status);
-    let _ = std::process::Command::new("nft").args(["delete", "table", "inet", "copper"]).status();
+    let _ = std::process::Command::new("nft").args(["delete", "table", "inet", "copper"])
+        .stderr(std::process::Stdio::null()).status();
     docker_user(false);
     mesh::remove();
     Ok(())

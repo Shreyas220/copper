@@ -164,9 +164,11 @@ case "$role" in
       # between projects, DNS for VMs. ingot itself never runs as root.
       fetch_unit copper-net.service
       install -m 644 "$tmp/copper-net.service" /etc/systemd/system/copper-net.service
-      # The shell script it replaces.
+      # The shell script it replaces, and where an early build kept the
+      # mesh key (Ubuntu's AppArmor profile for wg only reads /etc/wireguard).
       rm -f /usr/local/lib/copper/copper-net
       rmdir /usr/local/lib/copper 2>/dev/null || true
+      rm -rf /var/lib/copper-net
     else
       echo "+ write $CONF_DIR/ingot.env (INGOT_KILN=$kiln_url)"; echo "+ install /etc/systemd/system/ingot.service"
       echo "+ install /etc/systemd/system/copper-net.service"

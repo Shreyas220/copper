@@ -100,8 +100,10 @@ impl Tart {
         if let Some(config) = crate::vmnet::network_config(&inst.spec.nics, &inst.project) {
             std::fs::write(stage.join("network-config"), config)?;
         }
-        let tmp = path.with_extension("iso.tmp");
-        // hdiutil appends .iso itself when the output has no extension; give it the full name.
+        // hdiutil appends .iso to any other name, and won't overwrite what a
+        // crashed attempt left.
+        let tmp = path.with_extension("tmp.iso");
+        let _ = std::fs::remove_file(&tmp);
         run(Command::new("hdiutil")
             .args(["makehybrid", "-quiet", "-iso", "-joliet", "-iso-volume-name", "cidata", "-joliet-volume-name", "cidata", "-o"])
             .arg(&tmp)

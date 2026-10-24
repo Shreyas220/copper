@@ -161,6 +161,8 @@ enum KeyCmd {
 enum ProjectCmd {
     Ls,
     Create { name: String },
+    /// Remove an empty project; one with instances is refused
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -465,6 +467,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Project(ProjectCmd::Create { name }) => {
             let _: serde_json::Value = c.call(Method::POST, "/v1/projects", Some(serde_json::json!({ "name": name }))).await?;
             println!("created project {name}");
+        }
+        Cmd::Project(ProjectCmd::Rm { name }) => {
+            let () = c.call(Method::DELETE, &format!("/v1/projects/{name}"), None).await?;
+            println!("removed project {name}");
         }
         Cmd::Ls => {
             let v: Vec<Instance> = c.call(Method::GET, &format!("/v1/projects/{p}/instances"), None).await?;

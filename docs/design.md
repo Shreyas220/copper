@@ -90,7 +90,7 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - The console authenticates with a session cookie (`HttpOnly`, `SameSite=Strict`, 30 days, extended while used). Passwords are Argon2id. Nobody signs up: an admin makes a one-time invite link, valid 24 hours, which sets a password and optionally creates a project; naming an existing user makes it a password reset. The first admin's link comes from `kiln invite` on the kiln machine.
 - Cookie-authenticated writes must carry an `x-copper` header. A cross-site page can't add it without a CORS preflight, which kiln never grants. The serial console's WebSocket also checks `Origin`.
 - Projects can have caps on vCPUs, memory and disk. Like capacity, a create or resize that would exceed one is refused up front; lowering a cap evicts nothing.
-- Removing a user revokes their tokens and sessions and drops their empty projects. Users who still have instances can't be removed: delete is never implied.
+- Removing a user revokes their tokens and sessions and drops their empty projects. Users who still have instances can't be removed: delete is never implied. For the same reason `cu project rm` only removes an empty project.
 - Kiln binds the Tailscale address by default. The tailnet is the trust boundary for v1.
 - Kiln listens on the tailnet and loopback (see Networking). `--listen` takes several addresses, and `install.sh kiln --lan` still exists for setups without a tailnet, but that's plain HTTP: bearer tokens cross the LAN unencrypted, and kiln logs a warning for every listener outside loopback and the tailnet. TLS is not built.
 - `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.

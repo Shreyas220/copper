@@ -195,6 +195,18 @@ async fn each_node_learns_the_vms_of_its_projects_on_every_node() {
 }
 
 #[tokio::test]
+async fn only_an_empty_project_can_be_removed() {
+    let f = Fixture::new();
+    let (status, _) = f.create("vm").await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(f.call("DELETE", "/v1/projects/default", &f.user, Value::Null).await.0, StatusCode::CONFLICT, "deleting a project never deletes its vms");
+    assert_eq!(f.call("POST", "/v1/projects", &f.user, json!({"name": "scratch"})).await.0, StatusCode::CREATED);
+    assert_eq!(f.call("DELETE", "/v1/projects/alice:scratch", &f.admin, Value::Null).await.0, StatusCode::NO_CONTENT, "admins can tidy up too");
+    assert_eq!(f.call("DELETE", "/v1/projects/scratch", &f.user, Value::Null).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(f.call("POST", "/v1/projects", &f.user, json!({"name": "scratch"})).await.0, StatusCode::CREATED, "and the name is free again");
+}
+
+#[tokio::test]
 async fn nodes_learn_each_others_keys_and_where_to_reach_them() {
     let f = Fixture::new();
     let big = Capacity { vcpus: 8, memory_mb: 16384, disk_gb: 200 };

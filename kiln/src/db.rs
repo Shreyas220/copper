@@ -282,6 +282,12 @@ pub fn create_project(conn: &Connection, owner: Uuid, name: &str) -> rusqlite::R
     Ok(Project { id, name: name.to_string(), owner_id: owner, quota: QuotaCaps::default() })
 }
 
+/// The caller must have checked it holds no instances.
+pub fn delete_project(conn: &Connection, id: Uuid) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM projects WHERE id = ?1", [id.to_string()])?;
+    Ok(())
+}
+
 pub fn project_by_name(conn: &Connection, owner: Uuid, name: &str) -> rusqlite::Result<Option<Project>> {
     conn.query_row(
         &format!("SELECT {PROJECT_COLS} FROM projects p WHERE p.owner_id = ?1 AND p.name = ?2"),

@@ -2,7 +2,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use copper_api::*;
 use rand::RngCore;
@@ -16,6 +16,7 @@ use crate::{keys_api, placement, AppState};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/projects", get(list_projects).post(create_project))
+        .route("/v1/projects/{project}", delete(delete_project))
         .route("/v1/projects/{project}/instances", get(list_instances).post(create_instance))
         .route("/v1/projects/{project}/instances/check", post(check_instance))
         .route("/v1/projects/{project}/instances/{name}", get(get_instance).delete(delete_instance))
@@ -56,6 +57,18 @@ async fn create_project(State(state): State<AppState>, auth: Auth, Json(req): Js
     }
     let p = db::create_project(&conn, auth.0.id, &req.name)?;
     Ok((StatusCode::CREATED, Json(ProjectOut { name: p.name, owner: auth.0.name })))
+}
+
+/// Only an empty project can go: deleting one never deletes its VMs.
+async fn delete_project(State(state): State<AppState>, auth: Auth, Path(path): Path<String>) -> Result<StatusCode> {
+    let conn = state.db.lock().unwrap();
+    let p = project(&conn, &auth, &path)?;
+    if !db::list_instances_in_project(&conn, p.project.id)?.is_empty() {
+        return Err(Error::conflict("the project still has instances; remove them first"));
+    }
+    db::delete_project(&conn, p.project.id)?;
+    tracing::info!(project = %p.path, "project removed");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A project as addressed in a URL: `name` for your own, `owner:name` for an

@@ -242,7 +242,9 @@ async fn create_instance(State(state): State<AppState>, auth: Auth, Path(project
         running_since: None,
     };
     db::insert_instance(&tx, &row)?;
-    db::bump_generation(&tx, node.id)?;
+    // Its node, and every node with a VM in the same project, whose network
+    // maps now list it.
+    db::bump_project_nodes(&tx, row.project_id)?;
     let detail = format!("{} vcpu · {} MB · {} GB · {}", row.spec.vcpus, row.spec.memory_mb, row.spec.boot_disk.size_gb, row.spec.boot_disk.image);
     db::record(&tx, NewEvent::new("created", detail).instance(row.project_id, row.id, &row.name).node(node.id).by(&auth.0.name))?;
     tx.commit()?;

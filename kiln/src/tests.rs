@@ -153,6 +153,50 @@ async fn nodes_get_a_subnet_and_vms_a_fixed_address_in_it() {
     assert_eq!(f.call("GET", "/v1/projects/default/instances/a", &f.user, Value::Null).await.1["tailnet"], true);
 }
 
+#[tokio::test]
+async fn each_node_learns_the_vms_of_its_projects_on_every_node() {
+    let f = Fixture::new();
+    let big = Capacity { vcpus: 8, memory_mb: 16384, disk_gb: 200 };
+    let (a, b) = (f.add_node(big.clone()), f.add_node(big));
+    {
+        let conn = f.state.db.lock().unwrap();
+        db::create_project(&conn, db::user_by_name(&conn, "admin").unwrap().unwrap().id, "lab").unwrap();
+    }
+    let create = |project: &'static str, name: &'static str, node: NodeId| {
+        let body = json!({"name":name,"vcpus":1,"memory_mb":1024,"arch":"x86_64","image":"ubuntu","disk_gb":10,"ssh_keys":[KEY],"node":node});
+        let f = &f;
+        async move { assert_eq!(f.call("POST", &format!("/v1/projects/{project}/instances"), &f.admin, body).await.0, StatusCode::CREATED) }
+    };
+    let map = |node: NodeId| {
+        let f = &f;
+        async move {
+            let (_, d) = f.call("GET", &format!("/nodes/{node}/desired"), &format!("{:064x}", node.as_u128()), Value::Null).await;
+            let mut projects: Vec<(String, Vec<(String, String)>)> = d["map"]["projects"].as_array().cloned().unwrap_or_default().iter()
+                .map(|p| (p["name"].as_str().unwrap().to_string(),
+                          p["vms"].as_array().unwrap().iter().map(|v| (v["name"].as_str().unwrap().to_string(), v["address"].as_str().unwrap().to_string())).collect()))
+                .collect();
+            projects.sort();
+            (projects, d["generation"].as_u64().unwrap())
+        }
+    };
+    create("lab", "k3s-1", a).await;
+    create("default", "backup", a).await;
+    create("lab", "k3s-2", b).await;
+    let (on_a, _) = map(a).await;
+    let lab = ("lab".to_string(), vec![("k3s-1".to_string(), "10.42.1.10".to_string()), ("k3s-2".to_string(), "10.42.2.10".to_string())]);
+    assert_eq!(on_a, vec![("default".to_string(), vec![("backup".to_string(), "10.42.1.11".to_string())]), lab.clone()]);
+    let (on_b, before) = map(b).await;
+    assert_eq!(on_b, vec![lab], "b sees only the project it hosts, but all of that project");
+    // Another lab VM on a changes b's map, so b's long-poll wakes; a new VM in
+    // a project b doesn't host leaves b alone.
+    create("lab", "k3s-3", a).await;
+    let (on_b, after) = map(b).await;
+    assert!(after > before);
+    assert!(on_b[0].1.contains(&("k3s-3".to_string(), "10.42.1.12".to_string())));
+    create("default", "backup-2", a).await;
+    assert_eq!(map(b).await.1, after);
+}
+
 #[test]
 fn only_loopback_and_the_tailnet_are_trusted_for_plain_http() {
     for ok in ["127.0.0.1", "127.0.0.2", "100.75.219.83", "100.64.0.1", "100.127.255.254", "::1", "fd7a:115c:a1e0::1"] {

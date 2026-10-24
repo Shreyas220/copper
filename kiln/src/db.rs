@@ -572,6 +572,40 @@ pub fn list_instances_on_node(conn: &Connection, node: NodeId) -> rusqlite::Resu
         .collect()
 }
 
+/// Every VM, on any node, in a project that has a VM on `node`: what the
+/// node's walls and DNS need (see `NetworkMap`). Older bridged VMs have no
+/// copper address and are left out.
+pub fn network_map(conn: &Connection, node: NodeId) -> rusqlite::Result<NetworkMap> {
+    let projects: Vec<(Uuid, String)> = conn
+        .prepare("SELECT DISTINCT p.id, p.name FROM projects p JOIN instances i ON i.project_id = p.id WHERE i.node_id = ?1 ORDER BY p.id")?
+        .query_map([node.to_string()], |r| Ok((uuid_col(r, 0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let projects = projects
+        .into_iter()
+        .map(|(id, name)| {
+            let vms = list_instances_in_project(conn, id)?
+                .into_iter()
+                .filter_map(|i| {
+                    let address = i.spec.nics.iter().find_map(|n| n.address.as_deref())?.split('/').next()?.to_string();
+                    Some(VmAddress { name: i.name, address })
+                })
+                .collect();
+            Ok(ProjectNetwork { id, name, vms })
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(NetworkMap { projects })
+}
+
+/// Bump every node with a VM in `project`, because their network maps list
+/// the project's VMs. Called when a VM joins or leaves it.
+pub fn bump_project_nodes(conn: &Connection, project: Uuid) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE nodes SET generation = generation + 1 WHERE id IN (SELECT node_id FROM instances WHERE project_id = ?1)",
+        [project.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn set_desired(conn: &Connection, id: InstanceId, desired: DesiredState) -> rusqlite::Result<()> {
     conn.execute("UPDATE instances SET desired_state = ?1 WHERE id = ?2", params![enum_to_text(&desired), id.to_string()])?;
     Ok(())

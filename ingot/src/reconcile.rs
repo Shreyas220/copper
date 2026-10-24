@@ -63,7 +63,7 @@ impl<H: Hypervisor> Reconciler<H> {
             reserve,
             failures: HashMap::new(),
             stop_requested: HashMap::new(),
-            desired: DesiredNodeState { generation: 0, instances: vec![], network: None },
+            desired: DesiredNodeState { generation: 0, instances: vec![], network: None, map: NetworkMap::default() },
             images: None,
             waiting: HashMap::new(),
             configured: HashMap::new(),
@@ -337,7 +337,7 @@ mod tests {
                 boot_disk: BootDisk { image: "ubuntu".into(), sha256: None, size_gb: 10 },
                 nics: vec![], ssh_keys: vec![],
             },
-        }], network: None }
+        }], network: None, map: NetworkMap::default() }
     }
     #[test]
     fn running_instance_waits_for_its_image_without_spending_the_failure_budget() {

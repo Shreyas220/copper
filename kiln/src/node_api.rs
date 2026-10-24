@@ -105,7 +105,8 @@ fn read_desired(state: &AppState, id: NodeId, headers: &HeaderMap) -> Result<Des
         .map(|r| DesiredInstance { id: r.id, name: r.name, state: r.desired, spec: r.spec })
         .collect();
     let network = node.subnet.map(|n| state.vm_net.node(n));
-    Ok(DesiredNodeState { generation: node.generation, instances, network })
+    let map = db::network_map(&conn, id)?;
+    Ok(DesiredNodeState { generation: node.generation, instances, network, map })
 }
 
 async fn desired(
@@ -167,6 +168,7 @@ async fn observed(
         // and only if that confirmation is for the generation that asked for it.
         if row.desired == DesiredState::Absent && obs.state == ObservedState::Absent && report.generation_seen >= node.generation {
             db::delete_instance(&tx, obs.id)?;
+            db::bump_project_nodes(&tx, row.project_id)?;
             state.metrics.forget(Subject::Instance(obs.id));
             db::record(&tx, db::NewEvent::new("removed", format!("vm and disk gone from {}", node.hostname)).instance(row.project_id, row.id, &row.name).node(id))?;
             removed = true;

@@ -106,6 +106,38 @@ impl NodeNetwork {
     }
 }
 
+/// What a node needs to wire its VMs into the rest of copper. For every
+/// project with a VM on the node, every VM in that project on any node. The
+/// node lets traffic into one of its VMs only from that VM's own project, and
+/// its DNS answers a VM only with names from its own project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkMap {
+    #[serde(default)]
+    pub projects: Vec<ProjectNetwork>,
+}
+
+impl NetworkMap {
+    pub fn is_empty(&self) -> bool {
+        self.projects.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectNetwork {
+    /// Kiln's project id. Names are only unique per owner.
+    pub id: Uuid,
+    /// The middle of `<vm>.<project>.copper`.
+    pub name: String,
+    pub vms: Vec<VmAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmAddress {
+    pub name: String,
+    /// The VM's copper address alone, e.g. `10.42.3.10`.
+    pub address: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceSpec {
     pub vcpus: u32,
@@ -136,6 +168,10 @@ pub struct DesiredNodeState {
     /// The node's copper network. `None` only before kiln has assigned one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NodeNetwork>,
+    /// Who the node's VMs may talk to and look up. A VM on another node
+    /// joining or leaving one of this node's projects bumps the generation.
+    #[serde(default, skip_serializing_if = "NetworkMap::is_empty")]
+    pub map: NetworkMap,
 }
 
 // ---- observed state -------------------------------------------------------

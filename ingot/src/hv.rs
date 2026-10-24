@@ -16,6 +16,7 @@ pub enum DomState {
     /// Defined but not running (shut off, crashed, or never started).
     Off,
     /// Mid-transition, e.g. shutting down.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Other,
 }
 

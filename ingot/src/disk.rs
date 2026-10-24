@@ -13,6 +13,8 @@ pub struct Disks {
     pub images: PathBuf,
 }
 
+// The qcow2 overlays are libvirt's; Tart only shares the image catalogue.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl Disks {
     pub fn disk_path(&self, id: InstanceId) -> PathBuf {
         self.dir.join(format!("{id}.qcow2"))

@@ -174,6 +174,7 @@ impl Plan {
 
     /// The nftables script: declares the table first so deleting it is safe
     /// on a fresh boot, then replaces it whole, in one transaction.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn render(&self) -> String {
         let space = self.space;
         let mut s = String::from("table inet copper\ndelete table inet copper\ntable inet copper {\n");

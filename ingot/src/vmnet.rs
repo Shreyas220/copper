@@ -14,12 +14,14 @@ use copper_api::{Nic, NodeNetwork};
 pub const MTU: u32 = 1220;
 
 /// `copper-10.42.1.0-24`: the libvirt network for a node's /24.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn libvirt_name(subnet: &str) -> String {
     format!("copper-{}", subnet.replace('/', "-"))
 }
 
 /// `cu-42-1`: the host bridge, short enough for Linux's 15-character limit.
 /// copper-net.service matches every `cu-*` interface.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn bridge_name(net: &NodeNetwork) -> Option<String> {
     net.octets().map(|(b, n)| format!("cu-{b}-{n}"))
 }

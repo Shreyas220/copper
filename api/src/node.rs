@@ -121,12 +121,69 @@ impl NodeNetwork {
 pub struct NetworkMap {
     #[serde(default)]
     pub projects: Vec<ProjectNetwork>,
+    /// Every other approved node that has reported its WireGuard key: the
+    /// node's peers in the mesh between nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<MeshPeer>,
 }
 
 impl NetworkMap {
     pub fn is_empty(&self) -> bool {
-        self.projects.is_empty()
+        self.projects.is_empty() && self.peers.is_empty()
     }
+}
+
+/// Another node, as a peer in the mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshPeer {
+    pub node: NodeId,
+    pub hostname: String,
+    /// Its WireGuard public key, base64.
+    pub public_key: String,
+    /// The only addresses it may send from: its /24.
+    pub subnet: String,
+    /// Where to reach it, best first: LAN addresses, then its tailnet address.
+    pub endpoints: Vec<Endpoint>,
+}
+
+/// Somewhere a node's WireGuard port can be reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Endpoint {
+    /// `192.168.68.113:51820`
+    pub address: String,
+    pub via: Via,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    /// Straight across a network both nodes are on, encrypted once.
+    Lan,
+    /// Through Tailscale, inside its own WireGuard.
+    Tailnet,
+}
+
+/// What a node reports about its side of the mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshReport {
+    /// Its WireGuard public key, base64. The private half never leaves it.
+    pub public_key: String,
+    /// Where other nodes can reach it, best first.
+    pub endpoints: Vec<Endpoint>,
+    /// How it reaches each peer right now.
+    #[serde(default)]
+    pub peers: Vec<PeerPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPath {
+    pub node: NodeId,
+    /// The path of the last completed handshake; `None` until one completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    /// Seconds since that handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_age_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +287,9 @@ pub struct ObservedNodeState {
     /// tailnet devices reach its VMs directly. `None` without Tailscale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet_route: Option<bool>,
+    /// The node's side of the mesh, once its root helper has a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshReport>,
 }
 
 /// A point-in-time reading. CPU is in tenths of a percent of what the thing

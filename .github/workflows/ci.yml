@@ -13,9 +13,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --workspace
       - run: cargo check --locked -p ingot --features tart
-      - run: sh -n install.sh && sh -n dist/macos/prepare.sh && sh -n tests/copper-net.sh
-      # The rules `ingot net` applies, in throwaway network namespaces.
-      - run: cargo build --locked -p ingot && sudo apt-get install -y nftables && sudo sh tests/copper-net.sh
+      - run: sh -n install.sh && sh -n dist/macos/prepare.sh && sh -n tests/copper-net.sh && sh -n tests/mesh.sh
+      # The rules and the mesh `ingot net` sets up, in throwaway network namespaces.
+      - run: cargo build --locked -p ingot && sudo apt-get install -y nftables wireguard-tools
+      - run: sudo sh tests/copper-net.sh
+      - run: sudo sh tests/mesh.sh
 
   # The Tart backend only compiles for real here. GitHub's Apple silicon
   # runners can't nest virtualization, so it still isn't run against Tart.

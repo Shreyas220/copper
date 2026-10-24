@@ -328,7 +328,7 @@ mod tests {
         NetworkMap { projects: vec![
             project("lab", &[("k3s-1", "10.42.1.10"), ("k3s-3", "10.42.4.10")]),
             project("home", &[("backup", "10.42.1.11")]),
-        ] }
+        ], peers: vec![] }
     }
 
     /// A query for `name`, type `qtype`, with recursion desired.

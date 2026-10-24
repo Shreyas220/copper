@@ -11,6 +11,7 @@ mod identity;
 mod images;
 #[cfg(not(target_os = "macos"))]
 mod libvirt;
+mod mesh;
 mod net;
 mod reconcile;
 mod sessions;
@@ -296,10 +297,12 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
         }
         ready = false;
         let controller = rx.borrow_and_update().clone();
-        if let Some(d) = &controller.desired {
+        let mesh = controller.desired.as_ref().and_then(|d| {
             network.update(d);
-        }
-        let Some(report) = reconcile_snapshot(reconciler.clone(), controller.desired).await? else { continue };
+            Network::mesh_report(d)
+        });
+        let Some(mut report) = reconcile_snapshot(reconciler.clone(), controller.desired).await? else { continue };
+        report.mesh = mesh;
         if let Err(error) = kiln.observed(&report).await {
             failures.send(ReportFailure { revision: controller.revision, error }).await?;
             // Wait for the polling task to either suspend us or supply a newer
@@ -323,6 +326,24 @@ impl Network {
         let Some(node) = &d.network else { return };
         self.dns.update(node, &d.map);
         self.file.update(net::NetFile::new(d.generation, node.clone(), &d.map, self.dns.listening()));
+    }
+
+    /// This node's side of the mesh, from the root helper's status file:
+    /// its key, where it can be reached, and how it reaches each peer.
+    fn mesh_report(d: &DesiredNodeState) -> Option<MeshReport> {
+        let status: mesh::Status = serde_json::from_slice(&std::fs::read(net::STATUS_FILE).ok()?).ok()?;
+        let space = d.network.as_ref().and_then(|n| {
+            let (base, _) = n.space.split_once('/')?;
+            let [a, b, ..] = base.parse::<std::net::Ipv4Addr>().ok()?.octets();
+            Some((a, b))
+        });
+        let copper = |ip: std::net::Ipv4Addr| space.is_some_and(|(a, b)| ip.octets()[..2] == [a, b]);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_secs());
+        let peers = status.peers.iter().filter_map(|p| {
+            let node = d.map.peers.iter().find(|m| m.public_key == p.public_key)?.node;
+            Some(PeerPath { node, via: p.via, handshake_age_s: p.latest_handshake.map(|t| now.saturating_sub(t)) })
+        }).collect();
+        Some(MeshReport { public_key: status.public_key, endpoints: mesh::local_endpoints(status.port, copper), peers })
     }
 }
 

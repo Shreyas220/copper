@@ -21,13 +21,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, ensure, Context};
-use copper_api::{Generation, NetworkMap, NodeNetwork, ProjectNetwork};
+use copper_api::{Generation, MeshPeer, NetworkMap, NodeNetwork, ProjectNetwork};
 use serde::{Deserialize, Serialize};
+
+use crate::mesh::{self, Mesh};
 
 pub const FILE: &str = "network.json";
 /// Exists while copper's rules are in place; ingot reports it as
 /// `network_ready`.
 pub const READY_FILE: &str = "/run/copper/net-ready";
+/// The mesh's state, for ingot to report: `mesh::Status`.
+pub const STATUS_FILE: &str = "/run/copper/net-status.json";
+/// Where the node's WireGuard key lives, root's alone.
+const KEY_DIR: &str = "/var/lib/copper-net";
 const DEFAULT_SPACE: &str = "10.42.0.0/16";
 const PRIVATE: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
 const CHECK_EVERY: Duration = Duration::from_secs(2);
@@ -46,11 +52,14 @@ pub struct NetFile {
     /// gateway is redirected there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<SocketAddrV4>,
+    /// The other nodes, for the mesh.
+    #[serde(default)]
+    pub peers: Vec<MeshPeer>,
 }
 
 impl NetFile {
     pub fn new(generation: Generation, network: NodeNetwork, map: &NetworkMap, dns: Option<SocketAddrV4>) -> Self {
-        Self { generation, network, projects: map.projects.clone(), dns }
+        Self { generation, network, projects: map.projects.clone(), dns, peers: map.peers.clone() }
     }
 }
 
@@ -96,16 +105,18 @@ struct Wall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     space: Range,
+    subnet: Option<Range>,
     gateway: Option<Ipv4Addr>,
     walls: Vec<Wall>,
     dns: Option<SocketAddrV4>,
+    peers: Vec<mesh::Peer>,
 }
 
 impl Plan {
     /// Before ingot has written a file: NAT and nothing private, no walls
-    /// yet, so nothing gets into a VM that it didn't ask for.
+    /// yet, so nothing gets into a VM that it didn't ask for, and no peers.
     pub fn base() -> Self {
-        Self { space: Range::parse(DEFAULT_SPACE, 16).unwrap(), gateway: None, walls: vec![], dns: None }
+        Self { space: Range::parse(DEFAULT_SPACE, 16).unwrap(), subnet: None, gateway: None, walls: vec![], dns: None, peers: vec![] }
     }
 
     pub fn check(file: &NetFile) -> anyhow::Result<Self> {
@@ -138,7 +149,18 @@ impl Plan {
         if let Some(dns) = file.dns {
             ensure!(*dns.ip() == gateway && dns.port() >= 1024, "DNS must be on the gateway, on a port above 1023");
         }
-        Ok(Self { space, gateway: Some(gateway), walls, dns: file.dns })
+        let mut peers: Vec<mesh::Peer> = vec![];
+        for p in &file.peers {
+            ensure!(mesh::valid_key(&p.public_key), "{}: not a WireGuard key", p.hostname);
+            let range = Range::parse(&p.subnet, 24)?;
+            ensure!(space.contains(range.base) && range != subnet, "{}: {range} isn't another node's part of {space}", p.hostname);
+            ensure!(!peers.iter().any(|q| q.public_key == p.public_key || q.subnet == p.subnet), "{}: twice in the mesh", p.hostname);
+            let endpoints = p.endpoints.iter()
+                .map(|e| e.address.parse::<SocketAddrV4>().map(|a| (a, e.via)).with_context(|| format!("{}: endpoint {}", p.hostname, e.address)))
+                .collect::<anyhow::Result<_>>()?;
+            peers.push(mesh::Peer { public_key: p.public_key.clone(), subnet: range.to_string(), endpoints });
+        }
+        Ok(Self { space, subnet: Some(subnet), gateway: Some(gateway), walls, dns: file.dns, peers })
     }
 
     /// The nftables script: declares the table first so deleting it is safe
@@ -165,7 +187,12 @@ impl Plan {
             iifname \"cu-*\" ct state established,related accept\n    \
             iifname \"cu-*\" meta l4proto {{ tcp, udp }} th dport {ports} accept\n    \
             iifname \"cu-*\" drop\n  }}\n");
-        let _ = write!(s, "  chain forward {{\n    type filter hook forward priority filter - 5; policy accept;\n    \
+        let _ = write!(s, "  chain forward {{\n    type filter hook forward priority filter - 5; policy accept;\n");
+        if let Some(subnet) = self.subnet {
+            // Other nodes send only to this node's VMs, never through it.
+            let _ = writeln!(s, "    iifname \"{}\" ip daddr != {subnet} drop", mesh::IFACE);
+        }
+        let _ = write!(s, "    \
             # Into a VM: only from its own project.\n    \
             oifname \"cu-*\" ct state established,related accept\n    \
             oifname \"cu-*\" ip daddr vmap @walls\n    \
@@ -220,9 +247,12 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
         bail!("ingot net only knows nftables so far; macOS nodes keep macOS's own VM network");
     }
     let path = state_dir.join(FILE);
-    let ready = ready_file();
+    let paths = Paths::from_env();
+    let mut mesh = Mesh::open(&paths.keys)?;
     let mut seen: Option<(SystemTime, u64)> = None;
     let mut applied_at = std::time::Instant::now() - REAPPLY_EVERY;
+    let mut status = None;
+    let mut complained = None;
     loop {
         let stamp = std::fs::metadata(&path).ok().map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
         if stamp != seen || applied_at.elapsed() >= REAPPLY_EVERY {
@@ -231,7 +261,12 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, Plan::base())),
                 Err(e) => Err(e.into()),
             };
-            match plan.and_then(|(generation, plan)| apply(&plan, &ready).map(|()| generation)) {
+            let applied = plan.and_then(|(generation, plan)| {
+                apply(&plan, &paths.ready)?;
+                mesh.apply(&plan.peers)?;
+                Ok(generation)
+            });
+            match applied {
                 Ok(generation) => {
                     if stamp != seen {
                         tracing::info!(generation, "copper network applied");
@@ -244,6 +279,23 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
             seen = stamp;
             applied_at = std::time::Instant::now();
         }
+        match mesh.tick() {
+            Ok(now) => {
+                if status.as_ref() != Some(&now) {
+                    write_status(&paths.status, &now)?;
+                    status = Some(now);
+                }
+                complained = None;
+            }
+            Err(e) if once => return Err(e),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if complained.as_ref() != Some(&msg) {
+                    tracing::error!(error = %msg, "checking the mesh");
+                    complained = Some(msg);
+                }
+            }
+        }
         if once {
             return Ok(());
         }
@@ -251,8 +303,35 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
     }
 }
 
-fn ready_file() -> PathBuf {
-    std::env::var_os("COPPER_NET_READY").map(PathBuf::from).unwrap_or_else(|| READY_FILE.into())
+/// Where `ingot net` keeps things. Tests move them with `COPPER_NET_RUN`
+/// (the ready and status files) and `COPPER_NET_KEYS`.
+struct Paths {
+    ready: PathBuf,
+    status: PathBuf,
+    keys: PathBuf,
+}
+
+impl Paths {
+    fn from_env() -> Self {
+        let run = std::env::var_os("COPPER_NET_RUN").map(PathBuf::from);
+        let file = |default: &str| run.as_ref().map_or_else(|| PathBuf::from(default), |d| d.join(Path::new(default).file_name().unwrap()));
+        Self {
+            ready: file(READY_FILE),
+            status: file(STATUS_FILE),
+            keys: std::env::var_os("COPPER_NET_KEYS").map_or_else(|| PathBuf::from(KEY_DIR), PathBuf::from),
+        }
+    }
+}
+
+/// Readable by ingot, which isn't root; it holds only the public key.
+fn write_status(path: &Path, status: &mesh::Status) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(status)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn apply(plan: &Plan, ready: &Path) -> anyhow::Result<()> {
@@ -266,11 +345,15 @@ fn apply(plan: &Plan, ready: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ingot net --stop`: take copper's rules out again.
+/// `ingot net --stop`: take copper's rules and the mesh out again. The key
+/// stays, so the node keeps its identity in the mesh.
 pub fn stop() -> anyhow::Result<()> {
-    let _ = std::fs::remove_file(ready_file());
+    let paths = Paths::from_env();
+    let _ = std::fs::remove_file(&paths.ready);
+    let _ = std::fs::remove_file(&paths.status);
     let _ = std::process::Command::new("nft").args(["delete", "table", "inet", "copper"]).status();
     docker_user(false);
+    mesh::remove();
     Ok(())
 }
 
@@ -320,7 +403,35 @@ mod tests {
         ProjectNetwork { id: Uuid::new_v4(), name: name.into(), vms: vms.iter().map(|(n, a)| VmAddress { name: n.to_string(), address: a.to_string() }).collect() }
     }
     fn file(projects: Vec<ProjectNetwork>) -> NetFile {
-        NetFile { generation: 3, network: net(), projects, dns: None }
+        NetFile { generation: 3, network: net(), projects, dns: None, peers: vec![] }
+    }
+    fn peer(subnet: &str, key: char) -> MeshPeer {
+        MeshPeer { node: Uuid::new_v4(), hostname: format!("n-{subnet}"), public_key: format!("{}=", key.to_string().repeat(43)), subnet: subnet.into(),
+            endpoints: vec![copper_api::Endpoint { address: "192.168.68.113:51820".into(), via: copper_api::Via::Lan },
+                            copper_api::Endpoint { address: "100.69.49.52:51820".into(), via: copper_api::Via::Tailnet }] }
+    }
+
+    #[test]
+    fn other_nodes_send_only_to_this_nodes_vms() {
+        let rules = Plan::check(&NetFile { peers: vec![peer("10.42.3.0/24", 'B')], ..file(vec![]) }).unwrap().render();
+        assert!(rules.contains("iifname \"copper-wg\" ip daddr != 10.42.1.0/24 drop"), "{rules}");
+        // The mesh isn't a cu-* interface, so the walls don't stop traffic leaving through it.
+        assert!(!mesh::IFACE.starts_with("cu-"));
+    }
+
+    #[test]
+    fn peers_are_checked_like_everything_else() {
+        let ok = Plan::check(&NetFile { peers: vec![peer("10.42.3.0/24", 'B'), peer("10.42.4.0/24", 'C')], ..file(vec![]) }).unwrap();
+        assert_eq!(ok.peers[0].endpoints[0].1, copper_api::Via::Lan, "best first, as kiln sent them");
+        for bad in [
+            vec![peer("10.42.1.0/24", 'B')],
+            vec![peer("192.168.68.0/24", 'B')],
+            vec![peer("10.42.3.0/24", 'B'), peer("10.42.3.0/24", 'C')],
+            vec![MeshPeer { public_key: "nope".into(), ..peer("10.42.3.0/24", 'B') }],
+            vec![MeshPeer { endpoints: vec![copper_api::Endpoint { address: "192.168.68.113".into(), via: copper_api::Via::Lan }], ..peer("10.42.3.0/24", 'B') }],
+        ] {
+            assert!(Plan::check(&NetFile { peers: bad.clone(), ..file(vec![]) }).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -139,6 +139,9 @@ const MIGRATIONS: &[&str] = &[
         WHERE status != 'pending';
     CREATE UNIQUE INDEX nodes_by_subnet ON nodes(subnet);
     "#,
+    // v7: the mesh between nodes. A node's WireGuard key, where it can be
+    // reached and how it reaches its peers, as it last reported them.
+    "ALTER TABLE nodes ADD COLUMN mesh_json TEXT;",
 ];
 
 mod events;
@@ -334,6 +337,7 @@ pub struct NodeRow {
     /// As the node last reported them; see `ObservedNodeState`.
     pub network_ready: Option<bool>,
     pub tailnet_route: Option<bool>,
+    pub mesh: Option<MeshReport>,
 }
 
 impl NodeRow {
@@ -386,11 +390,49 @@ fn node_from_row(r: &Row) -> rusqlite::Result<NodeRow> {
         subnet: r.get(12)?,
         network_ready: r.get(13)?,
         tailnet_route: r.get(14)?,
+        // A report kiln can no longer read is as good as none: the node
+        // sends a fresh one every 10 s.
+        mesh: r.get::<_, Option<String>>(15)?.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
 const NODE_COLS: &str = "id, hostname, arch, status, generation, last_seen, capacity_json, token_hash, cpu_ratio, memory_ratio, disk_ratio, quiet, \
-                         subnet, network_ready, tailnet_route";
+                         subnet, network_ready, tailnet_route, mesh_json";
+
+/// Store what a node reports about its side of the mesh. When its key or
+/// where it can be reached changes, every approved node's peer list
+/// changes, so all of them are bumped.
+pub fn set_mesh(conn: &Connection, node: &NodeRow, mesh: &MeshReport) -> rusqlite::Result<bool> {
+    if node.mesh.as_ref() == Some(mesh) {
+        return Ok(false);
+    }
+    conn.execute("UPDATE nodes SET mesh_json = ?1 WHERE id = ?2", params![serde_json::to_string(mesh).unwrap(), node.id.to_string()])?;
+    let reachable = |m: &MeshReport| (m.public_key.clone(), m.endpoints.clone());
+    let changed = node.mesh.as_ref().map(reachable) != Some(reachable(mesh));
+    if changed {
+        bump_approved_nodes(conn)?;
+    }
+    Ok(changed)
+}
+
+/// Every approved node, for changes to the mesh they all share.
+pub fn bump_approved_nodes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("UPDATE nodes SET generation = generation + 1 WHERE status = 'approved'", [])?;
+    Ok(())
+}
+
+/// The node's peers: every other approved node with a subnet that has
+/// reported its WireGuard key.
+pub fn mesh_peers(conn: &Connection, vm_net: &crate::network::VmNet, node: NodeId) -> rusqlite::Result<Vec<MeshPeer>> {
+    Ok(list_nodes(conn)?
+        .into_iter()
+        .filter(|n| n.id != node && n.status == NodeDbStatus::Approved)
+        .filter_map(|n| {
+            let mesh = n.mesh?;
+            Some(MeshPeer { node: n.id, hostname: n.hostname, public_key: mesh.public_key, subnet: vm_net.node(n.subnet?).subnet, endpoints: mesh.endpoints })
+        })
+        .collect())
+}
 
 /// The node's subnet number, giving it the next one if it has none yet.
 /// Numbers are never reused, so a retired node's addresses never come back.
@@ -593,7 +635,7 @@ pub fn network_map(conn: &Connection, node: NodeId) -> rusqlite::Result<NetworkM
             Ok(ProjectNetwork { id, name, vms })
         })
         .collect::<rusqlite::Result<_>>()?;
-    Ok(NetworkMap { projects })
+    Ok(NetworkMap { projects, peers: vec![] })
 }
 
 /// Bump every node with a VM in `project`, because their network maps list

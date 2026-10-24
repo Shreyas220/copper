@@ -154,6 +154,7 @@ case "$role" in
     [ -n "$kiln_url" ] || kiln_url="http://kiln:8400"
     say "ingot will talk to $kiln_url; base images come from kiln's catalogue"
     command -v nft >/dev/null || die "nft not found; apt install nftables"
+    command -v wg >/dev/null || die "wg not found; apt install wireguard-tools (for the mesh between nodes)"
     run install -d -o copper -g copper -m 755 "$STATE_DIR/images" "$STATE_DIR/disks"
     if [ "$dry" = 0 ]; then
       printf 'INGOT_KILN=%s\n' "$kiln_url" > "$CONF_DIR/ingot.env"

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Test the rules `ingot net` applies, in throwaway network namespaces; the
-# host's own network is never touched. Needs root, nft and a built ingot.
+# host's own network is never touched. Needs root, nft, wireguard-tools and a
+# built ingot. tests/mesh.sh covers the mesh between nodes.
 # CI runs it; elsewhere:
 #
 #   cargo build -p ingot && sudo sh tests/copper-net.sh
@@ -78,7 +79,7 @@ cat >"$tmp/network.json" <<'EOF'
   ]
 }
 EOF
-export COPPER_NET_READY="$tmp/ready"
+export COPPER_NET_RUN="$tmp" COPPER_NET_KEYS="$tmp/keys"
 on cn-node "$ingot" net --once --state-dir "$tmp"
 
 # A listener that records who connected, and a connect that says yes or no.
@@ -115,7 +116,7 @@ listen cn-node 10.42.1.1 53
 for vm in cn-vm1:10.42.1.10 cn-vm2:10.42.1.11 cn-vm3:10.42.1.12; do listen "${vm%%:*}" "${vm#*:}" 22; done
 sleep 1
 
-expect yes "ingot net says it's ready" test -f "$tmp/ready"
+expect yes "ingot net says it's ready" test -f "$tmp/net-ready"
 expect yes "a VM reaches the internet" reaches cn-vm1 8.8.8.8 80
 expect yes "  as the node, through NAT" grep -qx 192.168.68.109 "$tmp/cn-lan-80"
 expect no  "a VM can't reach the home router" reaches cn-vm1 192.168.68.1 80
@@ -152,6 +153,6 @@ expect yes "the walls still stand after a reload" sh -c '! ip netns exec cn-vm1 
 
 on cn-node "$ingot" net --stop
 expect no "stop removes the rules" sh -c 'ip netns exec cn-node nft list tables | grep -q copper'
-expect no "  and the ready file" test -f "$tmp/ready"
+expect no "  and the ready file" test -f "$tmp/net-ready"
 
 if [ "$fails" = 0 ]; then echo "copper-net: all good"; else echo "copper-net: $fails failed"; exit 1; fi

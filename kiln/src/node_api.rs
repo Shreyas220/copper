@@ -101,7 +101,8 @@ fn read_desired(state: &AppState, id: NodeId, headers: &HeaderMap) -> Result<Des
     let conn = state.db.lock().unwrap();
     let node = authenticate(&conn, id, headers)?;
     let network = node.subnet.map(|n| state.vm_net.node(n));
-    let map = db::network_map(&conn, id)?;
+    let mut map = db::network_map(&conn, id)?;
+    map.peers = db::mesh_peers(&conn, &state.vm_net, id)?;
     // Every project with a VM here is in the map.
     let project = |p| map.projects.iter().find(|n| n.id == p).map(|n| n.name.clone()).unwrap_or_default();
     let instances = db::list_instances_on_node(&conn, id)?
@@ -157,6 +158,13 @@ async fn observed(
     if (report.network_ready, report.tailnet_route) != (node.network_ready, node.tailnet_route) {
         db::set_network_reports(&tx, id, report.network_ready, report.tailnet_route)?;
     }
+    let mesh_changed = match &report.mesh {
+        Some(mesh) => {
+            valid_mesh(mesh)?;
+            db::set_mesh(&tx, &node, mesh)?
+        }
+        None => false,
+    };
     for obs in &report.instances {
         let Some(row) = db::instance(&tx, obs.id)? else { continue };
         if row.node_id != id {
@@ -182,8 +190,17 @@ async fn observed(
     }
     if removed { db::bump_generation(&tx, id)?; }
     tx.commit()?;
-    if removed { state.notify_changed(); }
+    if removed || mesh_changed { state.notify_changed(); }
     Ok(())
+}
+
+/// Kiln hands a node's key and endpoints to every other node, so it only
+/// stores ones that look like a WireGuard key and IPv4 address:port pairs.
+fn valid_mesh(mesh: &MeshReport) -> Result<()> {
+    let key = mesh.public_key.len() == 44 && mesh.public_key.ends_with('=')
+        && mesh.public_key[..43].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
+    let endpoints = mesh.endpoints.len() <= 8 && mesh.endpoints.iter().all(|e| e.address.parse::<std::net::SocketAddrV4>().is_ok());
+    if key && endpoints { Ok(()) } else { Err(Error::bad_request("mesh report needs a WireGuard public key and at most 8 IPv4 endpoints")) }
 }
 
 /// Log state changes the node reports, and remember when a run began.

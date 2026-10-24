@@ -197,6 +197,53 @@ async fn each_node_learns_the_vms_of_its_projects_on_every_node() {
     assert_eq!(map(b).await.1, after);
 }
 
+#[tokio::test]
+async fn nodes_learn_each_others_keys_and_where_to_reach_them() {
+    let f = Fixture::new();
+    let big = Capacity { vcpus: 8, memory_mb: 16384, disk_gb: 200 };
+    let (a, b) = (f.add_node(big.clone()), f.add_node(big));
+    let secret = |n: NodeId| format!("{:064x}", n.as_u128());
+    {
+        let conn = f.state.db.lock().unwrap();
+        for n in [a, b] { db::ensure_subnet(&conn, n).unwrap(); }
+    }
+    let generation = |n: NodeId| db::node(&f.state.db.lock().unwrap(), n).unwrap().unwrap().generation;
+    let report = |n: NodeId, key: &str, lan: &str| {
+        let body = json!({"generation_seen": generation(n), "instances": [], "capacity": {"vcpus":8,"memory_mb":16384,"disk_gb":200},
+            "mesh": {"public_key": key, "endpoints": [{"address": lan, "via": "lan"}, {"address": "100.69.49.52:51820", "via": "tailnet"}],
+                     "peers": []}});
+        let f = &f;
+        async move { f.call("POST", &format!("/nodes/{n}/observed"), &secret(n), body).await.0 }
+    };
+    let peers = |n: NodeId| {
+        let f = &f;
+        async move { f.call("GET", &format!("/nodes/{n}/desired"), &secret(n), Value::Null).await.1["map"]["peers"].clone() }
+    };
+    let key_a = format!("{}=", "A".repeat(43));
+    let key_b = format!("{}=", "B".repeat(43));
+    assert_eq!(report(a, &key_a, "192.168.68.109:51820").await, StatusCode::OK);
+    assert_eq!(peers(b).await[0]["public_key"], json!(key_a));
+    assert_eq!(peers(b).await[0]["subnet"], json!("10.42.1.0/24"));
+    assert_eq!(peers(b).await[0]["endpoints"][0], json!({"address": "192.168.68.109:51820", "via": "lan"}));
+    assert_eq!(peers(a).await, json!(null), "b hasn't reported a key yet, and a isn't its own peer");
+    assert_eq!(report(b, &key_b, "192.168.68.113:51820").await, StatusCode::OK);
+    assert_eq!(peers(a).await[0]["node"], json!(b));
+    // Moving changes where it can be reached, which wakes its peers; the same
+    // report again doesn't.
+    let before = generation(b);
+    assert_eq!(report(a, &key_a, "192.168.1.20:51820").await, StatusCode::OK);
+    assert!(generation(b) > before);
+    let settled = generation(b);
+    assert_eq!(report(a, &key_a, "192.168.1.20:51820").await, StatusCode::OK);
+    assert_eq!(generation(b), settled);
+    // Anything kiln would pass on that isn't a key and addresses is refused.
+    assert_eq!(report(a, "not a key", "192.168.1.20:51820").await, StatusCode::BAD_REQUEST);
+    assert_eq!(report(a, &key_a, "192.168.1.20").await, StatusCode::BAD_REQUEST);
+    // A retired node leaves everyone's mesh.
+    assert_eq!(f.call("POST", &format!("/v1/nodes/{a}/retire"), &f.admin, Value::Null).await.0, StatusCode::OK);
+    assert_eq!(peers(b).await, json!(null));
+}
+
 #[test]
 fn only_loopback_and_the_tailnet_are_trusted_for_plain_http() {
     for ok in ["127.0.0.1", "127.0.0.2", "100.75.219.83", "100.64.0.1", "100.127.255.254", "::1", "fd7a:115c:a1e0::1"] {

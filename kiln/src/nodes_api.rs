@@ -71,6 +71,8 @@ async fn approve_node(State(state): State<AppState>, auth: Auth, Path(id): Path<
     }
     db::set_node_status(&conn, id, NodeDbStatus::Approved)?;
     let subnet = state.vm_net.node(db::ensure_subnet(&conn, id).map_err(|e| Error::conflict(e.to_string()))?).subnet;
+    // Its peers in the mesh change, once it has reported a key.
+    db::bump_approved_nodes(&conn)?;
     db::record(&conn, NewEvent::new("node approved", format!("{} can take work · its vms get {subnet}", node.hostname)).node(id).by(&auth.0.name))?;
     state.notify_changed();
     tracing::info!(node = %id, host = %node.hostname, "node approved");
@@ -85,6 +87,8 @@ async fn retire_node(State(state): State<AppState>, auth: Auth, Path(id): Path<N
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
     db::set_node_status(&tx, id, NodeDbStatus::Retired)?;
     db::fail_instances_on_node(&tx, id, "node retired")?;
+    // It leaves every other node's mesh.
+    db::bump_approved_nodes(&tx)?;
     db::record(&tx, NewEvent::new("node retired", format!("{}; its vms are marked failed, disks stay on the box", node.hostname)).node(id).by(&auth.0.name))?;
     tx.commit()?;
     state.notify_changed();

@@ -257,6 +257,7 @@ impl<H: Hypervisor> Reconciler<H> {
             usage: self.hv.host_usage(),
             network_ready: self.hv.network_ready(),
             tailnet_route,
+            mesh: None,
         }
     }
 

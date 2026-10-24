@@ -46,13 +46,15 @@ pub fn address_of(nics: &[Nic]) -> Option<Ipv4Addr> {
 /// The address is a /32 with the gateway on-link, so the guest sends
 /// everything to its node, other VMs on the same node included, and the
 /// node's firewall sees every packet. The search domain is the VM's project,
-/// so `k3s-2` finds `k3s-2.lab.copper`.
+/// so `k3s-2` finds `k3s-2.lab.copper`. No IPv6 link-local address: copper's
+/// VM networks are IPv4 only, and systemd-networkd won't set an MTU below
+/// IPv6's 1280 while IPv6 is on (libvirt's virtio caps it anyway; Tart's doesn't).
 pub fn network_config(nics: &[Nic], project: &str) -> Option<String> {
     let nic = nics.iter().find(|n| n.address.is_some())?;
     let (ip, net) = parse(nic.address.as_deref()?)?;
     let search = if project.is_empty() { String::new() } else { format!("\n      search: [{}]", serde_json::to_string(&format!("{project}.copper")).unwrap()) };
     Some(format!(
-        "version: 2\nethernets:\n  copper:\n    match:\n      macaddress: {mac}\n    mtu: {MTU}\n    addresses: [\"{ip}/32\"]\n    routes:\n      - to: default\n        via: {gw}\n        on-link: true\n    nameservers:\n      addresses: [{gw}]{search}\n",
+        "version: 2\nethernets:\n  copper:\n    match:\n      macaddress: {mac}\n    mtu: {MTU}\n    link-local: []\n    addresses: [\"{ip}/32\"]\n    routes:\n      - to: default\n        via: {gw}\n        on-link: true\n    nameservers:\n      addresses: [{gw}]{search}\n",
         mac = serde_json::to_string(&nic.mac).unwrap(),
         gw = net.gateway,
     ))
@@ -90,7 +92,7 @@ mod tests {
         assert!(config.contains("addresses: [\"10.42.1.10/32\"]"), "{config}");
         assert!(config.contains("via: 10.42.1.1\n        on-link: true"));
         assert!(config.contains("addresses: [10.42.1.1]\n      search: [\"lab.copper\"]"), "the node is the DNS server: {config}");
-        assert!(config.contains("mtu: 1220"));
+        assert!(config.contains("mtu: 1220\n    link-local: []"), "IPv4 only, so the MTU can go under 1280");
         assert!(!network_config(&[nic(Some("10.42.1.10/24"))], "").unwrap().contains("search"));
         assert!(network_config(&[nic(None)], "lab").is_none(), "bridged VMs keep the router's DHCP");
     }

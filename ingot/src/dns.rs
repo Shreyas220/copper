@@ -49,9 +49,6 @@ impl Dns {
     /// only exists once the node's copper network is up, so binding is
     /// retried until it does.
     pub async fn serve(self: Arc<Self>) {
-        if cfg!(target_os = "macos") {
-            return; // macOS nodes keep macOS's own DNS for VMs, for now
-        }
         let mut gateway = self.gateway.subscribe();
         let mut complained = None;
         loop {

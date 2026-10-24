@@ -1,7 +1,9 @@
 //! The host side of copper's VM network. The unprivileged ingot writes what
 //! the node's network should be to `<state dir>/network.json`; `ingot net`,
-//! run as root by copper-net.service, checks it and turns it into one
-//! nftables table, replaced atomically whenever the file changes:
+//! run as root (copper-net.service on Linux, the com.copper.net launchd
+//! daemon on macOS), checks it and turns it into firewall rules, replaced
+//! atomically whenever the file changes: one nftables table on Linux, one pf
+//! anchor on macOS.
 //!
 //! - VMs reach the internet, through NAT as the node, and other copper VMs.
 //! - Traffic into a VM is let in only from VMs in the same project (the
@@ -10,8 +12,9 @@
 //! - Nothing else private: not the home LAN, the tailnet, link-local, or the
 //!   node itself except DNS, which is redirected to ingot when it answers.
 //!
-//! Every rule matches only `cu-*` interfaces or copper's range, so the host's
-//! own traffic, ssh and Tailscale included, is never touched. The file comes
+//! Every rule matches only copper's interfaces (`cu-*` bridges on Linux,
+//! macOS's VM bridge), the mesh, or copper's range, so the host's own
+//! traffic, ssh and Tailscale included, is never touched. The file comes
 //! from a less privileged process, so nothing in it reaches the ruleset
 //! except addresses that parse and lie inside copper's range.
 
@@ -29,9 +32,14 @@ use crate::mesh::{self, Mesh};
 pub const FILE: &str = "network.json";
 /// Exists while copper's rules are in place; ingot reports it as
 /// `network_ready`.
-pub const READY_FILE: &str = "/run/copper/net-ready";
+pub const READY_FILE: &str = if cfg!(target_os = "macos") { "/var/run/copper/net-ready" } else { "/run/copper/net-ready" };
 /// The mesh's state, for ingot to report: `mesh::Status`.
-pub const STATUS_FILE: &str = "/run/copper/net-status.json";
+pub const STATUS_FILE: &str = if cfg!(target_os = "macos") { "/var/run/copper/net-status.json" } else { "/run/copper/net-status.json" };
+/// macOS's bridge for Tart's VMs (its shared network), and the pf anchor
+/// copper loads its rules into: macOS's own pf.conf evaluates every
+/// `com.apple/*` anchor, so no system file is edited.
+pub const MAC_BRIDGE: &str = "bridge100";
+const PF_ANCHOR: &str = "com.apple/290.copper";
 /// Where the node's WireGuard key lives, root's alone. Under /etc/wireguard
 /// because Ubuntu's AppArmor profile for `wg` lets it read keys nowhere else.
 const KEY_DIR: &str = "/etc/wireguard/copper";
@@ -213,6 +221,50 @@ impl Plan {
         let _ = write!(s, "  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr {space} ip daddr != {space} masquerade\n  }}\n}}\n");
         s
     }
+
+    /// The same rules for macOS's pf, for the anchor `PF_ANCHOR`. macOS keeps
+    /// its own VM network on `bridge` and copper adds its gateway beside it.
+    /// What macOS's pf does differently, found on the Mac mini:
+    /// - it doesn't count the gateway alias as `(self)`, and never sees the
+    ///   Mac's own packets leave through the bridge, so the gateway gets
+    ///   explicit rules: DNS, the answers to connections the Mac opened
+    ///   (they carry an ACK; a VM's own new connection starts with a bare
+    ///   SYN), and nothing else;
+    /// - between two VMs on one Mac both directions arrive in on the bridge,
+    ///   so a reply never matches its connection's state: walls take any
+    ///   flags, and a wall stops both directions;
+    /// - Apple's NAT only covers its own range, so copper adds its own.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn render_pf(&self, bridge: &str, uplink: &str, mesh: Option<&str>) -> String {
+        let (space, mut s) = (self.space, format!("table <copper_private> const {{ {PRIVATE} }}\n"));
+        for (i, w) in self.walls.iter().enumerate() {
+            let _ = writeln!(s, "table <project_{i}> const {{ {} }}\ntable <here_{i}> const {{ {} }}", join(&w.members), join(&w.local));
+        }
+        let (Some(subnet), Some(gw)) = (self.subnet, self.gateway) else {
+            // No network yet: nothing to translate, and no VMs to let in.
+            return s;
+        };
+        let _ = writeln!(s, "nat on {uplink} inet from {subnet} to ! {space} -> ({uplink}:0)");
+        if let Some(dns) = self.dns {
+            let _ = writeln!(s, "rdr pass on {bridge} inet proto {{ tcp, udp }} from {subnet} to {gw} port 53 -> {} port {}", dns.ip(), dns.port());
+        }
+        let _ = write!(s, "pass in quick on {bridge} inet proto {{ tcp, udp }} from {subnet} to {gw} port 53 keep state\n\
+            pass in quick on {bridge} inet proto tcp from {subnet} to {gw} flags A/A no state\n\
+            block drop in quick on {bridge} inet from {subnet} to {gw}\n");
+        let into = match mesh { Some(m) => format!("{{ {bridge} {m} }}"), None => bridge.to_string() };
+        for i in 0..self.walls.len() {
+            let _ = writeln!(s, "pass in quick on {into} inet from <project_{i}> to <here_{i}> flags any keep state");
+        }
+        let _ = writeln!(s, "block drop in quick on {into} inet to {subnet}");
+        if let Some(m) = mesh {
+            let _ = writeln!(s, "block drop in quick on {m} all");
+        }
+        let _ = write!(s, "pass in quick on {bridge} inet from {subnet} to {space} flags any keep state\n\
+            block drop in quick on {bridge} inet from {subnet} to <copper_private>\n\
+            block drop in quick on {bridge} inet6 all\n\
+            pass in quick on {bridge} inet from {subnet} to any keep state\n");
+        s
+    }
 }
 
 fn join(ips: &[Ipv4Addr]) -> String {
@@ -244,9 +296,6 @@ impl Writer {
 
 /// `ingot net`: apply the file now and whenever it changes, until stopped.
 pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
-    if cfg!(target_os = "macos") {
-        bail!("ingot net only knows nftables so far; macOS nodes keep macOS's own VM network");
-    }
     let path = state_dir.join(FILE);
     let paths = Paths::from_env();
     let mut mesh = Mesh::open(&paths.keys)?;
@@ -254,7 +303,17 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
     let mut applied_at = std::time::Instant::now() - REAPPLY_EVERY;
     let mut status = None;
     let mut complained = None;
+    let mut gateway = None;
     loop {
+        // macOS makes its VM bridge afresh whenever a VM starts after none
+        // ran, without copper's gateway on it.
+        if cfg!(target_os = "macos") {
+            if let Some(gw) = gateway {
+                if let Err(e) = mac_gateway(gw) {
+                    tracing::warn!(error = %format!("{e:#}"), "adding copper's gateway to the VM bridge");
+                }
+            }
+        }
         let stamp = std::fs::metadata(&path).ok().map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
         if stamp != seen || applied_at.elapsed() >= REAPPLY_EVERY {
             let plan = match std::fs::read(&path) {
@@ -263,8 +322,9 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
                 Err(e) => Err(e.into()),
             };
             let applied = plan.and_then(|(generation, plan)| {
-                apply(&plan, &paths.ready)?;
-                mesh.apply(&plan.peers)?;
+                gateway = plan.gateway;
+                mesh.apply(&plan.peers, plan.gateway)?;
+                apply(&plan, &paths.ready, mesh.iface())?;
                 Ok(generation)
             });
             match applied {
@@ -335,14 +395,56 @@ fn write_status(path: &Path, status: &mesh::Status) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply(plan: &Plan, ready: &Path) -> anyhow::Result<()> {
+#[cfg(not(target_os = "macos"))]
+fn apply(plan: &Plan, ready: &Path, _mesh: &str) -> anyhow::Result<()> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("turning on IP forwarding")?;
     pipe("nft", &["-f", "-"], &plan.render())?;
     docker_user(true);
+    mark_ready(ready)
+}
+
+#[cfg(target_os = "macos")]
+fn apply(plan: &Plan, ready: &Path, mesh: &str) -> anyhow::Result<()> {
+    pipe("sysctl", &["-w", "net.inet.ip.forwarding=1"], "")?;
+    let uplink = mac_uplink()?;
+    pipe("pfctl", &["-q", "-a", PF_ANCHOR, "-f", "-"], &plan.render_pf(MAC_BRIDGE, &uplink, Some(mesh)))?;
+    // macOS turns pf on for its VM network, but not before a VM runs. -E
+    // takes a reference rather than flipping pf on for everyone, once per run.
+    static ENABLED: std::sync::Once = std::sync::Once::new();
+    let mut enabled = Ok(());
+    ENABLED.call_once(|| enabled = pipe("pfctl", &["-q", "-E"], ""));
+    enabled?;
+    mark_ready(ready)
+}
+
+fn mark_ready(ready: &Path) -> anyhow::Result<()> {
     if let Some(dir) = ready.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(ready, b"")?;
+    Ok(())
+}
+
+/// The interface macOS's default route leaves by: where VM traffic is NATed.
+#[cfg(target_os = "macos")]
+fn mac_uplink() -> anyhow::Result<String> {
+    let out = std::process::Command::new("route").args(["-n", "get", "default"]).output()?;
+    String::from_utf8_lossy(&out.stdout).lines()
+        .find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
+        .filter(|i| i.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .context("no default route")
+}
+
+/// Copper's gateway beside macOS's own address on its VM bridge, once that
+/// exists, so VMs reach the Mac at their gateway and the Mac reaches the
+/// /24 through the bridge.
+fn mac_gateway(gw: Ipv4Addr) -> anyhow::Result<()> {
+    let out = std::process::Command::new("ifconfig").arg(MAC_BRIDGE).output()?;
+    if !out.status.success() || String::from_utf8_lossy(&out.stdout).contains(&format!("inet {gw} ")) {
+        return Ok(()); // no VM bridge yet, or already there
+    }
+    pipe("ifconfig", &[MAC_BRIDGE, "alias", &gw.to_string(), "netmask", "255.255.255.0"], "")?;
+    tracing::info!(bridge = MAC_BRIDGE, %gw, "added copper's gateway to the VM bridge");
     Ok(())
 }
 
@@ -352,9 +454,15 @@ pub fn stop() -> anyhow::Result<()> {
     let paths = Paths::from_env();
     let _ = std::fs::remove_file(&paths.ready);
     let _ = std::fs::remove_file(&paths.status);
-    let _ = std::process::Command::new("nft").args(["delete", "table", "inet", "copper"])
-        .stderr(std::process::Stdio::null()).status();
-    docker_user(false);
+    let quiet = |cmd: &str, args: &[&str]| {
+        let _ = std::process::Command::new(cmd).args(args).stderr(std::process::Stdio::null()).status();
+    };
+    if cfg!(target_os = "macos") {
+        quiet("pfctl", &["-q", "-a", PF_ANCHOR, "-F", "all"]);
+    } else {
+        quiet("nft", &["delete", "table", "inet", "copper"]);
+        docker_user(false);
+    }
     mesh::remove();
     Ok(())
 }
@@ -478,6 +586,31 @@ mod tests {
         ] {
             assert!(Plan::check(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn on_a_mac_the_same_walls_go_into_pf() {
+        let mac = NodeNetwork { subnet: "10.42.3.0/24".into(), gateway: "10.42.3.1".into(), space: "10.42.0.0/16".into() };
+        let lab = project("lab", &[("k3s-1", "10.42.1.10"), ("k3s-2", "10.42.3.10")]);
+        let home = project("home", &[("backup", "10.42.3.11")]);
+        let f = NetFile { network: mac, dns: Some("10.42.3.1:5300".parse().unwrap()), ..file(vec![lab, home]) };
+        let rules = Plan::check(&f).unwrap().render_pf("bridge100", "en0", Some("utun4"));
+        for want in [
+            "table <project_0> const { 10.42.1.10, 10.42.3.10 }\ntable <here_0> const { 10.42.3.10 }",
+            "nat on en0 inet from 10.42.3.0/24 to ! 10.42.0.0/16 -> (en0:0)",
+            "rdr pass on bridge100 inet proto { tcp, udp } from 10.42.3.0/24 to 10.42.3.1 port 53 -> 10.42.3.1 port 5300",
+            "pass in quick on bridge100 inet proto tcp from 10.42.3.0/24 to 10.42.3.1 flags A/A no state",
+            "pass in quick on { bridge100 utun4 } inet from <project_1> to <here_1> flags any keep state",
+            "block drop in quick on { bridge100 utun4 } inet to 10.42.3.0/24",
+            "block drop in quick on utun4 all",
+        ] {
+            assert!(rules.contains(want), "{want}\n---\n{rules}");
+        }
+        // pf wants tables, then translation, then filtering.
+        let at = |s: &str| rules.find(s).unwrap();
+        assert!(at("table <here_1>") < at("nat on") && at("rdr pass") < at("pass in quick"));
+        // The gateway's own rules come before anything that would let a VM at it.
+        assert!(at("to 10.42.3.1 flags A/A") < at("from <project_0>") && at("block drop in quick on bridge100 inet from 10.42.3.0/24 to 10.42.3.1") < at("to 10.42.0.0/16"));
     }
 
     #[test]

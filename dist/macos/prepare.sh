@@ -11,7 +11,8 @@
 # Options:
 #   --kiln URL         kiln base URL (default http://kiln:8400, needs MagicDNS)
 #   --authorize-key K  add an SSH public key for remote administration
-#   --update           only update ingot and cu and restart ingot; no sudo
+#   --update           only update ingot and cu and restart ingot; asks for
+#                      sudo only when the network helper changed
 #   --local-image      also download Ubuntu arm64 locally, for a kiln whose
 #                      catalogue has no aarch64 image
 #   --no-ingot         prepare the machine but don't install/run ingot
@@ -136,6 +137,37 @@ else
   install_bin "$STATE/src/target/release/cu" cu
 fi
 
+# ---- the network helper, as root -------------------------------------------
+# copper's gateway on macOS's VM bridge, its pf rules and the mesh need root;
+# ingot itself never runs as root. The daemon runs a root-owned copy of ingot,
+# so nothing in this user's home can change what root runs.
+helper=/usr/local/libexec/copper/ingot
+daemon=/Library/LaunchDaemons/com.copper.net.plist
+if ! cmp -s "$STATE/bin/ingot" "$helper" || [ ! -f "$daemon" ]; then
+  say "installing the network helper (asks for your password)"
+  sudo install -d -m 755 /usr/local/libexec/copper
+  sudo install -m 755 "$STATE/bin/ingot" "$helper.new"
+  sudo mv -f "$helper.new" "$helper"
+  sudo tee "$daemon" >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.copper.net</string>
+  <key>ProgramArguments</key><array><string>$helper</string><string>net</string><string>--state-dir</string><string>$STATE</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/var/log/copper-net.log</string>
+  <key>StandardErrorPath</key><string>/var/log/copper-net.log</string>
+</dict>
+</plist>
+EOF
+  sudo launchctl bootout system/com.copper.net 2>/dev/null || true
+  sudo launchctl bootstrap system "$daemon"
+fi
+
 # launchd has no equivalent of systemd's RestartPreventExitStatus, so a wrapper
 # turns ingot's "stop, don't restart" exit code 78 into a clean exit, which
 # KeepAlive's SuccessfulExit=false then leaves alone.
@@ -174,7 +206,7 @@ launchctl bootstrap "gui/$(id -u)" "$plist"
 say "done; ingot $("$STATE/bin/ingot" --version | awk '{print $2}') talks to $KILN"
 cat <<EOF
 ingot runs as a LaunchAgent for $USER and starts at login.
-  log:      tail -f $STATE/ingot.log
+  log:      tail -f $STATE/ingot.log   (network helper: /var/log/copper-net.log)
   update:   sh prepare.sh --update
   restart:  launchctl kickstart -k gui/$(id -u)/com.copper.ingot
   stop:     launchctl bootout gui/$(id -u)/com.copper.ingot

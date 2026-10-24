@@ -55,7 +55,7 @@ pub trait Hypervisor {
     fn addresses(&self, id: InstanceId) -> Vec<String>;
 
     /// Whether VMs here live on the node's copper network, at the addresses
-    /// kiln gives them. Tart keeps its own NAT for now.
+    /// kiln gives them.
     fn copper_network(&self) -> bool {
         false
     }

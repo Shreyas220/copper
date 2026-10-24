@@ -10,13 +10,18 @@
 //!   running: start writes and bootstraps it, stop/destroy boot it out and
 //!   remove it. RunAtLoad brings running VMs back after a reboot and login.
 //!
-//! Requirements on the node: `tart` (brew install cirruslabs/cli/tart),
-//! `qemu-img` (brew install qemu) for converting cloud images, and an
-//! aarch64 cloud image at `<images dir>/<name>.img`. The node must stay
-//! logged in, as Virtualization.framework runs in a user session.
+//! Network: VMs are on the node's copper /24 like anywhere else. Tart puts
+//! them on macOS's shared VM network (`bridge100`); kiln's MAC goes into the
+//! VM's Tart config, cloud-init gives it its fixed /32, and `ingot net`
+//! (the com.copper.net daemon, as root) adds copper's gateway to the bridge
+//! and loads copper's pf rules. Tart's own `tart ip` isn't used for them: it
+//! looks VMs up by MAC in macOS's DHCP leases, and Ubuntu identifies itself
+//! to DHCP by a generated ID instead.
 //!
-//! UNTESTED: this module has only been type-checked on Linux. First run on a
-//! Mac mini will shake out Tart flag details.
+//! Requirements on the node, all set up by dist/macos/prepare.sh: `tart`,
+//! `qemu-img` for converting cloud images, wireguard-go and wireguard-tools
+//! for the mesh, and a user session that stays logged in, as
+//! Virtualization.framework runs in one.
 
 // On Linux with `--features tart` the module is compiled but never selected.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -30,10 +35,6 @@ use copper_api::*;
 use crate::disk::{run, user_data_yaml, Disks};
 use crate::hv::{name_of, DomState, Hypervisor};
 
-/// VMs run on Tart's own NAT: Tart assigns their MAC and address (read back
-/// through `tart ip`), and ingot reaches them from the Mac. The address kiln
-/// gives on the node's copper /24 waits until the Mac's vmnet subnet is set
-/// to it.
 pub struct Tart {
     disks: Disks,
     home: PathBuf,
@@ -45,7 +46,7 @@ impl Tart {
         let home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?;
         let uid = unsafe { libc::getuid() };
         if Command::new("tart").arg("--version").output().is_err() {
-            bail!("tart not found; brew install cirruslabs/cli/tart");
+            bail!("tart not found; dist/macos/prepare.sh installs it");
         }
         std::fs::create_dir_all(&disks.dir)?;
         Ok(Self { disks, home, uid })
@@ -95,6 +96,10 @@ impl Tart {
         std::fs::create_dir_all(&stage)?;
         std::fs::write(stage.join("user-data"), user_data_yaml(&inst.name, &inst.spec))?;
         std::fs::write(stage.join("meta-data"), format!("instance-id: {}\nlocal-hostname: {}\n", inst.id, serde_json::to_string(&inst.name)?))?;
+        // Its fixed address, matched by the MAC `prepare` gave it.
+        if let Some(config) = crate::vmnet::network_config(&inst.spec.nics, &inst.project) {
+            std::fs::write(stage.join("network-config"), config)?;
+        }
         let tmp = path.with_extension("iso.tmp");
         // hdiutil appends .iso itself when the output has no extension; give it the full name.
         run(Command::new("hdiutil")
@@ -172,6 +177,9 @@ impl Hypervisor for Tart {
             // Create the VM shell, then replace its empty raw disk with the
             // cloud image converted to raw and grown to the requested size.
             run(Command::new("tart").args(["create", &name, "--linux", "--disk-size", &inst.spec.boot_disk.size_gb.to_string()]))?;
+            if let Some(nic) = inst.spec.nics.iter().find(|n| n.address.is_some()) {
+                set_mac(&dir.join("config.json"), &nic.mac)?;
+            }
             let disk = dir.join("disk.img");
             let tmp = dir.join("disk.img.tmp");
             run(Command::new("qemu-img").args(["convert", "-q", "-f", "qcow2", "-O", "raw"]).arg(&base).arg(&tmp))?;
@@ -271,6 +279,18 @@ impl Hypervisor for Tart {
         }))
     }
 
+    fn copper_network(&self) -> bool {
+        true
+    }
+
+    /// The gateway on the bridge and the pf rules are `ingot net`'s, as root;
+    /// this is whether they're in place.
+    fn network_ready(&self) -> Option<bool> {
+        Some(Path::new(crate::net::READY_FILE).exists())
+    }
+
+    /// Only VMs from before copper networks need this; the others' addresses
+    /// come from kiln.
     fn addresses(&self, id: InstanceId) -> Vec<String> {
         let out = Command::new("tart").args(["ip", &name_of(id), "--wait", "1"]).output();
         match out {
@@ -283,6 +303,15 @@ impl Hypervisor for Tart {
     }
 }
 
+/// Kiln's MAC for the VM, into Tart's `config.json`, so the guest's network
+/// config finds its card by it, as on Linux.
+fn set_mac(config: &Path, mac: &str) -> anyhow::Result<()> {
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(config).with_context(|| format!("reading {}", config.display()))?)?;
+    json["macAddress"] = serde_json::Value::String(mac.to_ascii_lowercase());
+    std::fs::write(config, serde_json::to_vec_pretty(&json)?)?;
+    Ok(())
+}
+
 fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
         .replace('\"', "&quot;").replace('\'', "&apos;")
@@ -293,7 +322,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plist_runs_tart_with_seed_on_its_own_nat() {
+    fn the_vm_gets_kilns_mac_so_its_network_config_finds_its_card() {
+        let dir = std::env::temp_dir().join(format!("copper-tart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"arch":"arm64","macAddress":"62:3e:21:e1:f6:a4","os":"linux","version":1}"#).unwrap();
+        set_mac(&config, "52:54:00:AB:cd:01").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!((json["macAddress"].as_str(), json["os"].as_str()), (Some("52:54:00:ab:cd:01"), Some("linux")), "the rest is Tart's");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plist_runs_tart_with_its_seed() {
         let t = Tart {
             disks: Disks { dir: "/tmp/copper".into(), images: "/tmp/copper/images".into() },
             home: "/Users/copper".into(),

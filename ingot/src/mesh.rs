@@ -156,6 +156,13 @@ pub struct Mesh {
     key_file: PathBuf,
     public_key: String,
     peers: HashMap<String, (Peer, PathChoice)>,
+    iface: String,
+    /// wireguard-go, on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    daemon: Option<std::process::Child>,
+    /// The routes made through the mesh, on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    routes: std::collections::HashSet<String>,
 }
 
 impl Mesh {
@@ -175,12 +182,19 @@ impl Mesh {
         if !valid_key(&public_key) {
             bail!("wg pubkey gave {public_key:?}");
         }
-        let mesh = Self { key_file, public_key, peers: HashMap::new() };
-        mesh.ensure_iface()?;
+        let mut mesh = Self { key_file, public_key, peers: HashMap::new(), iface: IFACE.into(), daemon: None, routes: Default::default() };
+        mesh.ensure_iface(None)?;
         Ok(mesh)
     }
 
-    fn ensure_iface(&self) -> anyhow::Result<()> {
+    /// The mesh's interface: `copper-wg` on Linux, whichever `utun`
+    /// wireguard-go was given on macOS.
+    pub fn iface(&self) -> &str {
+        &self.iface
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ensure_iface(&mut self, _gateway: Option<Ipv4Addr>) -> anyhow::Result<()> {
         if !Path::new("/sys/class/net").join(IFACE).exists() {
             run("ip", &["link", "add", IFACE, "type", "wireguard"], None).context("is the wireguard kernel module there?")?;
         }
@@ -190,23 +204,60 @@ impl Mesh {
         Ok(())
     }
 
+    /// macOS has no WireGuard in its kernel: wireguard-go runs as this
+    /// process's child and makes a `utun`. The gateway goes on it as a
+    /// point-to-point address, so the Mac has a source for the mesh.
+    #[cfg(target_os = "macos")]
+    fn ensure_iface(&mut self, gateway: Option<Ipv4Addr>) -> anyhow::Result<()> {
+        let alive = self.daemon.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        if !alive {
+            // One left by an earlier run would hold the port; its socket going makes it exit.
+            stop_wireguard_go();
+            std::fs::create_dir_all("/var/run/wireguard")?;
+            let child = std::process::Command::new("wireguard-go").args(["-f", "utun"]).env("WG_TUN_NAME_FILE", NAME_FILE)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn().context("starting wireguard-go")?;
+            let name = (0..50)
+                .find_map(|_| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    std::fs::read_to_string(NAME_FILE).ok().map(|s| s.trim().to_string()).filter(|s| s.starts_with("utun"))
+                })
+                .context("wireguard-go gave no interface name")?;
+            tracing::info!(iface = %name, "mesh interface up");
+            (self.iface, self.daemon) = (name, Some(child));
+            self.routes.clear();
+        }
+        let key = self.key_file.to_string_lossy();
+        run("wg", &["set", &self.iface, "listen-port", &PORT.to_string(), "private-key", &key], None)?;
+        if let Some(gw) = gateway {
+            let gw = gw.to_string();
+            run("ifconfig", &[&self.iface, "inet", &gw, &gw, "netmask", "255.255.255.255", "mtu", &crate::vmnet::MTU.to_string(), "up"], None)?;
+        }
+        Ok(())
+    }
+
     /// Bring the interface's peers and routes in line with `wanted`. A new
     /// peer, or one whose endpoints changed, starts over from its first.
-    pub fn apply(&mut self, wanted: &[Peer]) -> anyhow::Result<()> {
-        self.ensure_iface()?;
+    pub fn apply(&mut self, wanted: &[Peer], gateway: Option<Ipv4Addr>) -> anyhow::Result<()> {
+        self.ensure_iface(gateway)?;
         let (now, now_unix) = (Instant::now(), unix_now());
-        let present = dump()?;
+        let present = dump(&self.iface)?;
         for key in present.keys().filter(|k| !wanted.iter().any(|p| &&p.public_key == k)) {
-            run("wg", &["set", IFACE, "peer", key, "remove"], None)?;
+            run("wg", &["set", &self.iface, "peer", key, "remove"], None)?;
         }
         self.peers.retain(|k, _| wanted.iter().any(|p| &p.public_key == k));
         for peer in wanted {
             let same = self.peers.get(&peer.public_key).is_some_and(|(p, _)| p == peer) && present.contains_key(&peer.public_key);
             if !same {
                 self.peers.insert(peer.public_key.clone(), (peer.clone(), PathChoice::new(now, now_unix)));
-                set_peer(peer, 0)?;
+                set_peer(&self.iface, peer, 0)?;
             }
         }
+        self.sync_routes(wanted)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sync_routes(&mut self, wanted: &[Peer]) -> anyhow::Result<()> {
         let routes = run("ip", &["-4", "route", "show", "dev", IFACE], None)?;
         for line in routes.lines() {
             let dest = line.split_whitespace().next().unwrap_or_default();
@@ -220,11 +271,31 @@ impl Mesh {
         Ok(())
     }
 
+    /// macOS routes have no `replace`; the ones made here are remembered, and
+    /// all of them go with the interface when wireguard-go restarts.
+    #[cfg(target_os = "macos")]
+    fn sync_routes(&mut self, wanted: &[Peer]) -> anyhow::Result<()> {
+        for subnet in self.routes.clone() {
+            if !wanted.iter().any(|p| p.subnet == subnet) {
+                let _ = run("route", &["-n", "delete", "-net", &subnet, "-interface", &self.iface], None);
+                self.routes.remove(&subnet);
+            }
+        }
+        for peer in wanted {
+            if !self.routes.contains(&peer.subnet) {
+                let _ = run("route", &["-n", "delete", "-net", &peer.subnet], None);
+                run("route", &["-n", "add", "-net", &peer.subnet, "-interface", &self.iface], None)?;
+                self.routes.insert(peer.subnet.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Move peers whose path isn't working on to their next endpoint, and
     /// say where each one stands.
     pub fn tick(&mut self) -> anyhow::Result<Status> {
         let (now, now_unix) = (Instant::now(), unix_now());
-        let present = dump()?;
+        let present = dump(&self.iface)?;
         let mut peers = vec![];
         for (key, (peer, path)) in &mut self.peers {
             let (endpoint, handshake) = present.get(key).cloned().unwrap_or((None, None));
@@ -235,7 +306,7 @@ impl Mesh {
             }
             if let Step::Try(i) = step {
                 tracing::info!(peer = %key, endpoint = %peer.endpoints[i].0, "trying another path to a peer");
-                set_peer(peer, i)?;
+                set_peer(&self.iface, peer, i)?;
             }
             let fresh = handshake.is_some_and(|t| now_unix.saturating_sub(t) <= STALE_AFTER);
             let via = endpoint.filter(|_| fresh).map(|e| if tailnet(*e.ip()) { Via::Tailnet } else { Via::Lan });
@@ -248,9 +319,9 @@ impl Mesh {
 
 /// Configure a peer on its `i`th endpoint afresh: removing it first drops
 /// any session, so the new endpoint has to complete a handshake of its own.
-fn set_peer(peer: &Peer, i: usize) -> anyhow::Result<()> {
-    let _ = run("wg", &["set", IFACE, "peer", &peer.public_key, "remove"], None);
-    let mut args = vec!["set", IFACE, "peer", &peer.public_key, "allowed-ips", &peer.subnet, "persistent-keepalive", KEEPALIVE];
+fn set_peer(iface: &str, peer: &Peer, i: usize) -> anyhow::Result<()> {
+    let _ = run("wg", &["set", iface, "peer", &peer.public_key, "remove"], None);
+    let mut args = vec!["set", iface, "peer", &peer.public_key, "allowed-ips", &peer.subnet, "persistent-keepalive", KEEPALIVE];
     let endpoint = peer.endpoints.get(i).map(|(e, _)| e.to_string());
     if let Some(e) = &endpoint {
         args.extend(["endpoint", e]);
@@ -263,14 +334,16 @@ fn set_peer(peer: &Peer, i: usize) -> anyhow::Result<()> {
 /// another site with the same address answers too, and then the WireGuard
 /// handshake that follows decides.
 fn pings(ip: Ipv4Addr) -> bool {
-    std::process::Command::new("ping").args(["-c", "1", "-W", "1", &ip.to_string()])
+    // A second to answer: `-W 1` on Linux, `-t 1` on macOS, where -W is milliseconds.
+    let wait = if cfg!(target_os = "macos") { "-t" } else { "-W" };
+    std::process::Command::new("ping").args(["-c", "1", wait, "1", &ip.to_string()])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .status().is_ok_and(|s| s.success())
 }
 
-/// `wg show copper-wg dump`: each peer's current endpoint and last handshake.
-fn dump() -> anyhow::Result<HashMap<String, (Option<SocketAddrV4>, Option<u64>)>> {
-    Ok(parse_dump(&run("wg", &["show", IFACE, "dump"], None)?))
+/// `wg show <iface> dump`: each peer's current endpoint and last handshake.
+fn dump(iface: &str) -> anyhow::Result<HashMap<String, (Option<SocketAddrV4>, Option<u64>)>> {
+    Ok(parse_dump(&run("wg", &["show", iface, "dump"], None)?))
 }
 
 fn parse_dump(out: &str) -> HashMap<String, (Option<SocketAddrV4>, Option<u64>)> {
@@ -331,7 +404,25 @@ pub fn tailnet(ip: Ipv4Addr) -> bool {
 
 /// `ingot net --stop`: the interface, its peers and routes go.
 pub fn remove() {
-    let _ = run("ip", &["link", "del", IFACE], None);
+    if cfg!(target_os = "macos") {
+        stop_wireguard_go();
+    } else {
+        let _ = run("ip", &["link", "del", IFACE], None);
+    }
+}
+
+/// Where wireguard-go writes the `utun` it was given, on macOS.
+const NAME_FILE: &str = "/var/run/wireguard/copper-wg.name";
+
+/// wireguard-go exits once its control socket is gone.
+fn stop_wireguard_go() {
+    if let Ok(name) = std::fs::read_to_string(NAME_FILE) {
+        let name = name.trim();
+        if name.starts_with("utun") && name[4..].bytes().all(|b| b.is_ascii_digit()) {
+            let _ = std::fs::remove_file(format!("/var/run/wireguard/{name}.sock"));
+        }
+        let _ = std::fs::remove_file(NAME_FILE);
+    }
 }
 
 fn unix_now() -> u64 {

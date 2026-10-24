@@ -78,7 +78,7 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - Image names are platform-neutral (`ubuntu-24.04`); the catalogue holds one blob per arch under the same name.
 
 ## macOS node
-- `dist/macos/prepare.sh` turns an Apple silicon Mac into a node: Remote Login, no sleep, restart after power loss, Homebrew, Tart, QEMU, and ingot plus cu under `~/.copper`.
+- `dist/macos/prepare.sh` turns an Apple silicon Mac into a node: Remote Login (or a pointer to the switch in System Settings, where macOS refuses `systemsetup`), no sleep, restart after power loss, Homebrew, QEMU and the WireGuard tools from Homebrew, Tart from its GitHub release with its checksum checked (its Homebrew tap doesn't load in current Homebrew), and ingot plus cu under `~/.copper`.
 - ingot runs as the LaunchAgent `com.copper.ingot` in the logged-in user's session, with `KeepAlive` and logs at `~/.copper/ingot.log`. launchd has no `RestartPreventExitStatus`, so a wrapper turns exit status 78 into a clean exit that `KeepAlive` leaves alone.
 - Each running VM is its own LaunchAgent, so restarting or updating ingot never stops guests.
 - Settings live in `~/.copper/config`. `prepare.sh --update` fetches new binaries, swaps them by rename (overwriting a running signed binary in place gets it killed on Apple silicon), and restarts ingot without sudo.

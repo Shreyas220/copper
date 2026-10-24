@@ -18,6 +18,7 @@
 set -eu
 
 REPO="Shreyas220/copper"
+TART_VERSION="2.41.1"
 STATE="$HOME/.copper"
 CONFIG="$STATE/config"
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
@@ -55,7 +56,11 @@ printf 'KILN=%s\n' "$KILN" > "$CONFIG"
 if [ "$UPDATE" = 0 ]; then
   # ---- remote access ---------------------------------------------------------
   say "enabling Remote Login (sshd)"
-  sudo systemsetup -setremotelogin on >/dev/null
+  # Recent macOS only lets systemsetup do this with Full Disk Access for the
+  # terminal; the switch in System Settings always works.
+  if ! sudo systemsetup -setremotelogin on >/dev/null 2>&1 && ! nc -z -G 2 localhost 22 2>/dev/null; then
+    say "turn on Remote Login yourself: System Settings > General > Sharing > Remote Login"
+  fi
   if [ -n "$KEY" ]; then
     mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
     touch "$HOME/.ssh/authorized_keys"; chmod 600 "$HOME/.ssh/authorized_keys"
@@ -78,9 +83,22 @@ if [ "$UPDATE" = 0 ]; then
     say "installing Homebrew"
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   fi
-  say "installing tart and qemu"
-  brew list cirruslabs/cli/tart >/dev/null 2>&1 || brew install cirruslabs/cli/tart
-  brew list qemu >/dev/null 2>&1 || brew install qemu
+  say "installing qemu and wireguard"
+  for f in qemu wireguard-go wireguard-tools; do brew list "$f" >/dev/null 2>&1 || brew install "$f"; done
+  # Tart from its own release, checksum checked: its Homebrew tap doesn't
+  # load in current Homebrew.
+  if ! command -v tart >/dev/null; then
+    say "installing tart $TART_VERSION"
+    t=$(mktemp -d)
+    base="https://github.com/cirruslabs/tart/releases/download/$TART_VERSION"
+    curl -fsSL -o "$t/tart.tar.gz" "$base/tart.tar.gz"
+    curl -fsSL -o "$t/sums" "$base/tart_${TART_VERSION}_checksums.txt"
+    (cd "$t" && grep ' tart.tar.gz$' sums | shasum -a 256 -c -) >/dev/null || die "tart.tar.gz doesn't match its checksum"
+    mkdir -p "$HOME/Applications"
+    tar -xzf "$t/tart.tar.gz" -C "$HOME/Applications"
+    ln -sf "$HOME/Applications/tart.app/Contents/MacOS/tart" /opt/homebrew/bin/tart
+    rm -rf "$t"
+  fi
 
   # ---- optional local image --------------------------------------------------
   # Normally kiln's catalogue serves the arm64 image by hash. A local file is

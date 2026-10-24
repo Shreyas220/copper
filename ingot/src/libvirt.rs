@@ -174,7 +174,22 @@ impl Libvirt {
     pub fn ensure_network(&self, net: &NodeNetwork) -> anyhow::Result<()> {
         let name = vmnet::libvirt_name(&net.subnet);
         let network = match Network::lookup_by_name(&self.conn, &name) {
-            Ok(n) => n,
+            Ok(n) => {
+                let defined = n.get_xml_desc(sys::VIR_NETWORK_XML_INACTIVE).map_err(err)?;
+                if network_outdated(&defined) {
+                    Network::define_xml(&self.conn, &network_xml(net)?).map_err(err).context("updating the copper network")?;
+                    // A running network only picks the change up when it
+                    // restarts, which would cut its VMs off, so restart it
+                    // only while none are attached; otherwise at the next boot.
+                    let live = n.get_xml_desc(0).map_err(err)?;
+                    let restart = n.is_active().map_err(err)? && connections(&live) == 0;
+                    if restart {
+                        n.destroy().map_err(err).context("restarting the copper network")?;
+                    }
+                    tracing::info!(network = %name, restart, "copper network updated");
+                }
+                n
+            }
             Err(e) if e.code() == virt::error::ErrorNumber::NoNetwork => {
                 let n = Network::define_xml(&self.conn, &network_xml(net)?).map_err(err).context("defining the copper network")?;
                 tracing::info!(network = %name, subnet = %net.subnet, "copper network defined");
@@ -277,13 +292,16 @@ fn domain_xml(id: InstanceId, spec: &InstanceSpec, disk: &Path, seed: &Path) -> 
 }
 
 /// On the node's copper network, with libvirt's own clean-traffic filter so a
-/// VM can only send as its own MAC and address. Older VMs stay on their bridge.
+/// VM can only send as its own MAC and address, and an isolated port so it
+/// can't reach other VMs except through the host. Older VMs stay on their
+/// bridge.
 fn nic_xml(n: &Nic) -> String {
     match n.address.as_deref().and_then(vmnet::parse) {
         Some((ip, net)) => format!(
             "    <interface type='network'>\n      <source network='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n      \
+             <mtu size='{mtu}'/>\n      <port isolated='yes'/>\n      \
              <filterref filter='clean-traffic'>\n        <parameter name='IP' value='{ip}'/>\n      </filterref>\n    </interface>\n",
-            xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&n.mac)
+            xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&n.mac), mtu = vmnet::MTU
         ),
         None => format!(
             "    <interface type='bridge'>\n      <source bridge='{}'/>\n      <mac address='{}'/>\n      <model type='virtio'/>\n    </interface>\n",
@@ -297,9 +315,23 @@ fn nic_xml(n: &Nic) -> String {
 fn network_xml(net: &NodeNetwork) -> anyhow::Result<String> {
     let bridge = vmnet::bridge_name(net).ok_or_else(|| anyhow!("bad subnet {}", net.subnet))?;
     Ok(format!(
-        "<network>\n  <name>{}</name>\n  <forward mode='open'/>\n  <bridge name='{}' stp='off' delay='0'/>\n  <ip address='{}' netmask='255.255.255.0'/>\n</network>\n",
-        xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&bridge), xml_escape(&net.gateway)
+        "<network>\n  <name>{}</name>\n  <forward mode='open'/>\n  <bridge name='{}' stp='off' delay='0'/>\n  <mtu size='{}'/>\n  <ip address='{}' netmask='255.255.255.0'/>\n</network>\n",
+        xml_escape(&vmnet::libvirt_name(&net.subnet)), xml_escape(&bridge), vmnet::MTU, xml_escape(&net.gateway)
     ))
+}
+
+/// Whether a defined network predates something `network_xml` now sets.
+fn network_outdated(defined: &str) -> bool {
+    !defined.contains(&format!("<mtu size='{}'/>", vmnet::MTU))
+}
+
+/// How many interfaces are attached, from a running network's live XML
+/// (`<network connections='2'>`; absent when there are none).
+fn connections(live: &str) -> usize {
+    live.split_once("connections='")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 fn xml_escape(value: &str) -> String {
@@ -349,6 +381,8 @@ mod tests {
         assert!(x.contains("<source network='copper-10.42.1.0-24'/>"));
         assert!(x.contains("<filterref filter='clean-traffic'>"));
         assert!(x.contains("<parameter name='IP' value='10.42.1.10'/>"));
+        assert!(x.contains("<port isolated='yes'/>"), "VMs only reach each other through the host");
+        assert!(x.contains("<mtu size='1220'/>"));
         let older = nic_xml(&nic(None, "br0"));
         assert!(older.contains("<source bridge='br0'/>") && !older.contains("filterref"), "bridged VMs stay as they were");
     }
@@ -360,5 +394,14 @@ mod tests {
         assert!(x.contains("<forward mode='open'/>"));
         assert!(x.contains("<bridge name='cu-42-1'"));
         assert!(x.contains("<ip address='10.42.1.1' netmask='255.255.255.0'/>"));
+        assert!(x.contains("<mtu size='1220'/>"));
+        assert!(!network_outdated(&x));
+        assert!(network_outdated("<network><name>copper-10.42.1.0-24</name><forward mode='open'/></network>"));
+    }
+
+    #[test]
+    fn a_network_is_restarted_only_with_nothing_attached() {
+        assert_eq!(connections("<network connections='2'>\n  <name>copper-10.42.1.0-24</name>"), 2);
+        assert_eq!(connections("<network>\n  <name>copper-10.42.1.0-24</name>"), 0);
     }
 }

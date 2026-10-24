@@ -11,6 +11,11 @@ use copper_api::{Nic, NodeNetwork};
 /// Written by copper-net.service once its rules are in place.
 pub const READY_FILE: &str = "/run/copper/net-ready";
 
+/// Every VM's MTU: Tailscale carries 1280, less WireGuard's 60 for the mesh
+/// between nodes. The same everywhere, because a VM can't change its MTU when
+/// the path to a peer's node does.
+pub const MTU: u32 = 1220;
+
 /// `copper-10.42.1.0-24`: the libvirt network for a node's /24.
 pub fn libvirt_name(subnet: &str) -> String {
     format!("copper-{}", subnet.replace('/', "-"))
@@ -40,14 +45,16 @@ pub fn address_of(nics: &[Nic]) -> Option<Ipv4Addr> {
 
 /// cloud-init network config (v2) giving the guest its fixed address, with
 /// the node as router and DNS server. `None` for NICs without an address.
+///
+/// The address is a /32 with the gateway on-link, so the guest sends
+/// everything to its node, other VMs on the same node included, and the
+/// node's firewall sees every packet.
 pub fn network_config(nics: &[Nic]) -> Option<String> {
     let nic = nics.iter().find(|n| n.address.is_some())?;
-    let address = nic.address.as_deref()?;
-    let (_, net) = parse(address)?;
+    let (ip, net) = parse(nic.address.as_deref()?)?;
     Some(format!(
-        "version: 2\nethernets:\n  copper:\n    match:\n      macaddress: {mac}\n    addresses: [{address}]\n    routes:\n      - to: default\n        via: {gw}\n    nameservers:\n      addresses: [{gw}]\n",
+        "version: 2\nethernets:\n  copper:\n    match:\n      macaddress: {mac}\n    mtu: {MTU}\n    addresses: [\"{ip}/32\"]\n    routes:\n      - to: default\n        via: {gw}\n        on-link: true\n    nameservers:\n      addresses: [{gw}]\n",
         mac = serde_json::to_string(&nic.mac).unwrap(),
-        address = serde_json::to_string(address).unwrap(),
         gw = net.gateway,
     ))
 }
@@ -78,12 +85,13 @@ mod tests {
     }
 
     #[test]
-    fn guests_get_their_address_router_and_dns() {
+    fn guests_get_a_slash_32_behind_their_node() {
         let config = network_config(&[nic(Some("10.42.1.10/24"))]).unwrap();
         assert!(config.contains("macaddress: \"52:54:00:12:34:56\""));
-        assert!(config.contains("addresses: [\"10.42.1.10/24\"]"));
-        assert!(config.contains("via: 10.42.1.1"));
-        assert!(config.contains("addresses: [10.42.1.1]"));
+        assert!(config.contains("addresses: [\"10.42.1.10/32\"]"), "{config}");
+        assert!(config.contains("via: 10.42.1.1\n        on-link: true"));
+        assert!(config.contains("addresses: [10.42.1.1]"), "the node is the DNS server");
+        assert!(config.contains("mtu: 1220"));
         assert!(network_config(&[nic(None)]).is_none(), "bridged VMs keep the router's DHCP");
     }
 }

@@ -55,13 +55,14 @@ on cn-node ip addr add 10.42.1.1/24 dev cu-42-1
 on cn-node ip link set cu-42-1 up
 n=0
 for vm in cn-vm1:10.42.1.10 cn-vm2:10.42.1.11 cn-vm3:10.42.1.12; do
-  ns=${vm%%:*} addr=${vm#*:} n=$((n + 1))
-  ip link add "vnet$n" netns cn-node type veth peer name eth0 netns "$ns"
+  # Not $ns: on() sets that.
+  vmns=${vm%%:*} vmaddr=${vm#*:} n=$((n + 1))
+  ip link add "vnet$n" netns cn-node type veth peer name eth0 netns "$vmns"
   on cn-node ip link set "vnet$n" master cu-42-1 up
   on cn-node bridge link set dev "vnet$n" isolated on
-  on "$ns" ip link set eth0 mtu 1220 up
-  on "$ns" ip addr add "$addr/32" dev eth0
-  on "$ns" ip route add default via 10.42.1.1 dev eth0 onlink
+  on "$vmns" ip link set eth0 mtu 1220 up
+  on "$vmns" ip addr add "$vmaddr/32" dev eth0
+  on "$vmns" ip route add default via 10.42.1.1 dev eth0 onlink
 done
 
 cat >"$tmp/network.json" <<'EOF'
@@ -138,6 +139,16 @@ expect yes "a VM on another node reaches a VM of its project here" reaches cn-la
 expect no  "  but not one of another project" reaches cn-lan 10.42.1.10 22 10.42.2.11
 expect no  "a LAN host with a route still can't get in" reaches cn-lan 10.42.1.10 22 192.168.68.50
 expect yes "the node (ingot) reaches its VMs" reaches cn-node 10.42.1.11 22
+
+# Once ingot answers DNS, port 53 on the gateway goes to it instead.
+listen cn-node 10.42.1.1 5300
+sed 's|"generation": 1,|"generation": 2, "dns": "10.42.1.1:5300",|' "$tmp/network.json" >"$tmp/next.json"
+mv "$tmp/next.json" "$tmp/network.json"
+on cn-node "$ingot" net --once --state-dir "$tmp"
+sleep 1
+expect yes "DNS on the gateway goes to ingot" reaches cn-vm1 10.42.1.1 53
+expect yes "  which sees which VM asked" grep -qx 10.42.1.10 "$tmp/cn-node-5300"
+expect yes "the walls still stand after a reload" sh -c '! ip netns exec cn-vm1 python3 -c "import socket; socket.create_connection((\"10.42.1.11\", 22), timeout=1)" 2>/dev/null'
 
 on cn-node "$ingot" net --stop
 expect no "stop removes the rules" sh -c 'ip netns exec cn-node nft list tables | grep -q copper'

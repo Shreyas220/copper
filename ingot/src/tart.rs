@@ -39,17 +39,23 @@ pub struct Tart {
     disks: Disks,
     home: PathBuf,
     uid: u32,
+    /// Where ingot found tart. The VMs' LaunchAgents name it whole, because
+    /// launchd's PATH doesn't reach Homebrew's.
+    tart: PathBuf,
 }
 
 impl Tart {
     pub fn new(disks: Disks) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?;
         let uid = unsafe { libc::getuid() };
-        if Command::new("tart").arg("--version").output().is_err() {
-            bail!("tart not found; dist/macos/prepare.sh installs it");
+        let tart = std::env::var_os("PATH")
+            .and_then(|p| std::env::split_paths(&p).map(|d| d.join("tart")).find(|f| f.is_file()))
+            .context("tart not found; dist/macos/prepare.sh installs it")?;
+        if Command::new(&tart).arg("--version").output().is_err() {
+            bail!("{} doesn't run", tart.display());
         }
         std::fs::create_dir_all(&disks.dir)?;
-        Ok(Self { disks, home, uid })
+        Ok(Self { disks, home, uid, tart })
     }
 
     fn vm_dir(&self, id: InstanceId) -> PathBuf {
@@ -74,6 +80,13 @@ impl Tart {
         let entries: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).context("parsing tart list")?;
         let name = name_of(id);
         Ok(entries.into_iter().find(|e| e["Name"].as_str() == Some(&name)))
+    }
+
+    /// Whether the VM's LaunchAgent has tart running; `None` when the job
+    /// isn't loaded.
+    fn job_running(&self, id: InstanceId) -> Option<bool> {
+        let out = Command::new("launchctl").args(["print", &format!("gui/{}/{}", self.uid, Self::label(id))]).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == "state = running"))
     }
 
     fn bootout(&self, id: InstanceId) -> anyhow::Result<()> {
@@ -114,8 +127,9 @@ impl Tart {
     }
 
     fn plist(&self, id: InstanceId, seed: &Path) -> String {
+        let tart = self.tart.to_string_lossy();
         let args = [
-            "tart", "run", &name_of(id), "--no-graphics",
+            &*tart, "run", &name_of(id), "--no-graphics",
             "--disk", &format!("{}:ro", seed.display()),
         ];
         let strings: String = args.iter().map(|a| format!("    <string>{}</string>\n", xml_escape(a))).collect();
@@ -240,6 +254,13 @@ impl Hypervisor for Tart {
         if self.state(id)? == Some(DomState::Running) {
             return Ok(());
         }
+        match self.job_running(id) {
+            // tart is up; Tart lists the VM as running in a moment.
+            Some(true) => return Ok(()),
+            // Loaded but exited: launchd won't load the same job twice.
+            Some(false) => self.bootout(id)?,
+            None => {}
+        }
         let plist = self.plist_path(id);
         std::fs::create_dir_all(plist.parent().unwrap())?;
         crate::state::write_atomic(&plist, self.plist(id, &self.seed_path(id)).as_bytes())?;
@@ -341,9 +362,11 @@ mod tests {
             disks: Disks { dir: "/tmp/copper".into(), images: "/tmp/copper/images".into() },
             home: "/Users/copper".into(),
             uid: 501,
+            tart: "/opt/homebrew/bin/tart".into(),
         };
         let id = InstanceId::nil();
         let p = t.plist(id, &t.seed_path(id));
+        assert!(p.contains("<string>/opt/homebrew/bin/tart</string>"), "launchd's PATH has no Homebrew");
         assert!(p.contains("<string>com.copper.vm.00000000-0000-0000-0000-000000000000</string>"));
         assert!(p.contains("<string>copper-00000000-0000-0000-0000-000000000000</string>"));
         assert!(p.contains("<string>/tmp/copper/00000000-0000-0000-0000-000000000000-seed.iso:ro</string>"));

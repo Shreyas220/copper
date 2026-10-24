@@ -50,7 +50,7 @@ Failed: the agent retries start with backoff for 5 minutes, then reports failed 
 ## Node side
 - libvirt via `qemu:///system` for v1. Copper domains are named `copper-<instance id>`; everything else on the host is ignored.
 - Boot disks are qcow2 overlays on base images. Base images come from kiln's catalogue by hash (see Images); a node-local `<state dir>/images/<name>.img` is used only when kiln has no catalogue entry for the name and arch.
-- cloud-init seed ISO carries the hostname, SSH keys and, on a copper network, the VM's fixed address; it also installs `qemu-guest-agent`. Older bridged VMs' addresses come from the agent once it's up, with the host ARP table as a fallback before that.
+- cloud-init seed ISO carries the hostname, SSH keys and, on a copper network, the VM's fixed address (see Addresses); it also installs `qemu-guest-agent`. Older bridged VMs' addresses come from the agent once it's up, with the host ARP table as a fallback before that.
 - Stop is ACPI shutdown, then destroy after 60 s if the guest ignores it.
 - A reconciliation timer runs every 10 s independently of long-poll responses. Failed starts and stops retry for 5 min, then the instance reports `failed` until its desired state changes. Deletes retry every 10 s indefinitely while connected; exhausting the failure budget makes the error visible but does not stop cleanup retries.
 - Capacity reported to kiln is host threads and memory minus a configurable reserve (default 2 threads, 4 GB) for the host itself. The reserve is node configuration; overcommit is kiln policy (see Placement).
@@ -74,7 +74,7 @@ Failed: the agent retries start with backoff for 5 minutes, then reports failed 
 ## Backends
 The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both storage preparation and the VM lifecycle, so each platform keeps its own disk format. The backend is chosen at compile time by target OS.
 - **libvirt** (Linux): the production backend above.
-- **tart** (macOS, Apple silicon): Apple's Virtualization.framework through the Tart CLI. The boot disk is the cloud image converted to raw under `~/.tart/vms/copper-<id>/`; the seed ISO is built with `hdiutil`. launchd replaces libvirtd for persistence: a running VM has a LaunchAgent whose job is `tart run`, created on start and removed on stop, so running VMs come back after a reboot and login. Guests are aarch64 only, bridged onto a host interface given by `INGOT_BRIDGE` (default `en0`); kiln's per-NIC bridge and MAC are ignored and the address is read back with `tart ip`. The node needs `tart`, `qemu-img`, an arm64 cloud image under the same image name, and a user session that stays logged in. Type-checked on Linux with `cargo check -p ingot --features tart`; not yet run on a Mac.
+- **tart** (macOS, Apple silicon): Apple's Virtualization.framework through the Tart CLI. The boot disk is the cloud image converted to raw under `~/.tart/vms/copper-<id>/`; the seed ISO is built with `hdiutil`. launchd replaces libvirtd for persistence: a running VM has a LaunchAgent whose job is `tart run`, created on start and removed on stop, so running VMs come back after a reboot and login. Guests are aarch64 only, on macOS's shared VM network (see Networking); the address is read back with `tart ip`. The node needs `tart`, `qemu-img`, an arm64 cloud image under the same image name, and a user session that stays logged in. Type-checked on Linux with `cargo check -p ingot --features tart`; not yet run on a Mac.
 - Image names are platform-neutral (`ubuntu-24.04`); the catalogue holds one blob per arch under the same name.
 
 ## macOS node
@@ -96,15 +96,43 @@ The reconciler drives a `Hypervisor` trait (`ingot/src/hv.rs`) that owns both st
 - `cu resize <name> --vcpus --memory --disk` works on stopped instances; `cu image ls` lists the catalogue.
 
 ## Networking
-One architecture wherever a node is: on the home router, or anywhere else on the tailnet.
+One architecture wherever a node is: on the home router, or anywhere else on the tailnet. Copper is the network under its VMs the way a cloud's VPC is under a Kubernetes cluster: k3s or containers run on top and bring their own networking. The model is Calico's: routed, a /24 per node, policy on every host, routes and keys handed out by the control plane. Project walls, names and the mesh are being built; `roadmap.md` tracks what's done.
+
+### Kiln and the tailnet
 - The tailnet is copper's network. Kiln listens on its tailnet address and loopback, not the LAN. Nodes, and everyone using copper, reach kiln over the tailnet; at home Tailscale connects directly across the LAN, so nothing is slower.
 - Nodes only make outbound connections, to kiln. Kiln never connects to a node or to a VM.
-- VMs live on copper's own network, not on the LAN of the site they run at. Copper's address space is `10.42.0.0/16` (`kiln --vm-network`). Each node gets `10.42.N.0/24` when it's approved, numbered from 1 and never reused; its gateway, `10.42.N.1`, is the node itself. Each VM gets a fixed address in its node's /24, from `.10` up, chosen by kiln at create and written into the guest by cloud-init, with the gateway as its router and DNS server. Addresses are known before a VM boots.
-- On a Linux node the network is a libvirt network `copper-10.42.N.0-24` on bridge `cu-42-N`, in `open` mode: libvirt runs DNS for it and adds no firewall rules. `copper-net.service`, installed by `install.sh ingot` because it needs root, owns the host side: an nftables table `inet copper` that masquerades VM traffic leaving copper's range, lets VMs reach the internet and each other, and refuses everything else private (the home LAN, the tailnet, link-local) and everything on the node except DNS. On hosts with Docker it also lets `cu-*` traffic past Docker's forward-drop policy through `DOCKER-USER`. It matches nothing that isn't on a `cu-*` bridge or from copper's range. Ingot reports whether it's active, and the console warns on nodes where it isn't, because their VMs have no internet.
 - Reaching a VM always goes through its node. `cu ssh`, `cu ssh-config`, `cu forward <vm> <port>` and the serial console all open a session at kiln. Kiln offers it to the VM's node over the long-poll the node keeps open (`GET /nodes/{id}/consoles`); ingot connects to its own VM on that port and dials kiln back with `Upgrade: copper-console`, or reports why it couldn't. Kiln answers 503 while a VM is still booting, and cu retries.
-- Direct access over the tailnet: a node can advertise its /24 as a Tailscale subnet route (`sudo tailscale set --advertise-routes=10.42.N.0/24`, then approve it in the Tailscale admin console). Tailnet devices then reach VMs at their copper addresses, and nodes that also run with `--accept-routes` carry VM-to-VM traffic between nodes. Ingot reports whether its route is live, and the Nodes page shows the command until it is. Copper never changes tailscaled's settings itself.
-- VMs made before copper networks are bridged onto `br0` with addresses from the home router. They keep running as they were and are reached through their node like the rest.
-- macOS nodes use Tart's own NAT for now: VMs get Tart's 192.168.64.x addresses and are reached through ingot the same way. Putting them on the node's copper /24 needs the Mac's vmnet subnet set, which waits for the Mac mini.
+- Copper doesn't use Tailscale subnet routes, and the tailnet has no route into VM networks. Plain `ssh` to a VM's address from a tailnet device doesn't work by design; a jump host in kiln is the planned way to get it. Copper never changes tailscaled's settings.
+
+### Addresses
+- Copper's address space is `10.42.0.0/16` (`kiln --vm-network`). Each node gets `10.42.N.0/24` when it's approved, numbered from 1 and never reused; its gateway, `10.42.N.1`, is the node itself. `10.42.0.0/24` is never given to a node; it's kept for load-balancer addresses.
+- Each VM gets a fixed address in its node's /24, from `.10` up, chosen by kiln at create. A VM moved to another node would get a new address and keep its name.
+- Cloud-init writes the address as a `/32` with the gateway on-link, as the VM's router and DNS server, and sets the MTU to 1220. A `/32` means the VM sends everything to its gateway, including traffic for VMs on the same node.
+
+### Between VMs
+- Every packet goes through its host. VM ports on the node's bridge are isolated (libvirt's `<port isolated='yes'/>`, a `private` member on macOS), so VMs can't reach each other directly even with crafted frames. The host's routing and firewall see all VM traffic, whichever node the other end is on.
+- Projects are walls. A node forwards traffic into one of its VMs only from VMs in the same project. Every VM can reach the internet, and nothing else private: not the home LAN, the tailnet, link-local, or the nodes themselves except DNS. There's no broadcast or multicast between VMs.
+- Source addresses can be trusted: libvirt's `clean-traffic` filter pins each VM to its own address and MAC, and between nodes WireGuard only accepts a node's own /24 from its key.
+- Names: ingot answers DNS on each gateway. `<vm>.<project>.copper` and, inside the project, plain `<vm>` resolve to the VM's address; everything else is forwarded to the node's own resolver. A VM only gets answers about its own project. Port 53 on the gateway is redirected to ingot, so any OS and, later, containers use it unchanged.
+
+### Between nodes: the mesh
+- Every node has a WireGuard interface, `cu-wg`, with every other approved node as a peer. A peer's allowed addresses are exactly its /24. Approving a node adds it everywhere; retiring removes it.
+- Each node makes its own key pair; the private half never leaves it. Ingot reports the public key, the WireGuard port (UDP 51820), its LAN addresses and its tailnet address. Kiln hands every node its peers.
+- Path: a node tries its peer's LAN address first and uses it once a WireGuard handshake completes. With no handshake within 5 s it uses the peer's tailnet address, and retries the LAN every 5 minutes. A handshake only completes with the real peer's key, so a wrong guess (another site using the same LAN range, a Wi-Fi that isolates clients) just falls back. A node that leaves home moves to the tailnet by itself and keeps its addresses.
+- WireGuard runs on every link, the home network included, so the receiving node knows which node a packet came from and nothing on the LAN can pose as a VM. On the LAN it's encrypted once; over the tailnet twice, inside Tailscale's own WireGuard.
+- MTU: Tailscale carries 1280, less WireGuard's 60, so VMs use 1220 everywhere. A VM can't change its MTU when its peer's path changes.
+- Ingot reports each peer's path (LAN, tailnet, or no handshake) and the Nodes page shows it.
+
+### Who applies it
+- Kiln sends each node, with its desired state: its peers, its VMs with their projects, the addresses of those projects' VMs elsewhere, and the names they can look up, under a generation number.
+- Ingot stays unprivileged. It writes that to a network file and serves DNS. A root helper, `ingot net`, run by `copper-net.service` on Linux and a launchd daemon on macOS, watches the file, checks it, and applies all of it at once: firewall rules, `cu-wg` peers and routes, the DNS redirect. It only accepts copper-shaped input (addresses in copper's range, its own interface names), so a broken ingot can't reconfigure the host. It writes a status file (applied generation, public key, each peer's path) that ingot reports back.
+- If kiln is unreachable, every node keeps the last network it applied, so VMs keep talking.
+
+### Linux node
+- The network is a libvirt network `copper-10.42.N.0-24` on bridge `cu-42-N`, in `open` mode: libvirt adds no firewall rules. Copper's nftables table `inet copper` masquerades VM traffic leaving copper's range, enforces the walls, redirects DNS, and refuses everything else private and everything on the node except DNS and the mesh's port. On hosts with Docker it also lets `cu-*` traffic past Docker's forward-drop policy through `DOCKER-USER`. It matches nothing that isn't on a `cu-*` or `cu-wg` interface or from copper's range. Ingot reports whether it's active, and the console warns on nodes where it isn't, because their VMs have no network.
+
+### macOS node
+- Tart VMs use macOS's shared VM network on `bridge100`. The plan: set its subnet to the node's /24 so the Mac is `10.42.N.1`, mark each VM's `vmenet` port private, load copper's pf rules beside Apple's NAT, and run the mesh with `wireguard-go`. Until that's tested on the Mac mini, VMs get macOS's 192.168.64.x addresses and are reached through ingot the same way.
 
 ## SSH access
 - `cu ssh <name>` works the same from anywhere, through kiln and the VM's node (see Networking).

@@ -21,8 +21,13 @@ One architecture wherever a node is: on the home router or anywhere on the tailn
 - [x] `copper-net.service`: NAT to the internet, nothing private, nothing on the node but DNS. Tested in network namespaces in CI.
 - [x] Reach VMs through their node: `cu ssh`, `cu forward <vm> <port>` and the serial console, with kiln never connecting to a node or a VM.
 - [x] Kiln on the tailnet and loopback only.
-- [ ] Each node advertises its /24 as a Tailscale subnet route, so tailnet devices reach VMs at their addresses and VMs reach each other across nodes. The owner's switch to flip; the Nodes page shows the command until it's live.
-- [ ] Tart nodes on copper networks: set the Mac's vmnet subnet to the node's /24. Waits for the Mac mini.
+- [ ] Every VM packet goes through its host: `/32` addresses with an on-link gateway, isolated bridge ports, MTU 1220.
+- [ ] Projects are walls: VMs only reach VMs in their own project.
+- [ ] Names: `<vm>.<project>.copper` from ingot's DNS on each gateway, per project.
+- [ ] A root helper (`ingot net`) applies each node's network from a file ingot writes, replacing the `copper-net` script.
+- [ ] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path.
+- [ ] Tart nodes on copper networks: the Mac's VM network on the node's /24, pf rules, private ports, `wireguard-go`. Tested by hand on the Mac mini first.
+- [ ] A jump host in kiln, so plain `ssh` reaches a VM by name without cu.
 
 ## Scheduling and capacity
 
@@ -49,4 +54,5 @@ One architecture wherever a node is: on the home router or anywhere on the tailn
 - Data volumes and snapshots.
 - CKS: clusters of k3s VMs with a copper cloud controller and CSI driver.
 - Backups of kiln's database, with a restore that can't resurrect deleted VMs.
-- Private networks per project, stable addresses and port forwarding.
+- Load-balancer addresses from `10.42.0.0/24` for k3s, and ingress through kiln.
+- Containers on the same network: a veth into the node's bridge, an address, walls and a name, like a VM.

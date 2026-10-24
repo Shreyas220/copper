@@ -63,8 +63,7 @@ impl Dns {
                         tracing::info!(%at, "answering DNS for VMs");
                         complained = None;
                         tokio::select! {
-                            _ = self.clone().serve_udp(Arc::new(udp)) => {}
-                            _ = self.clone().serve_tcp(tcp) => {}
+                            _ = self.clone().answer_on(udp, tcp) => {}
                             _ = gateway.changed() => {}
                         }
                         *self.listening.lock().unwrap() = None;
@@ -84,6 +83,10 @@ impl Dns {
                 _ = tokio::time::sleep(RETRY) => {}
             }
         }
+    }
+
+    async fn answer_on(self: Arc<Self>, udp: UdpSocket, tcp: TcpListener) {
+        tokio::join!(self.clone().serve_udp(Arc::new(udp)), self.serve_tcp(tcp));
     }
 
     async fn serve_udp(self: Arc<Self>, socket: Arc<UdpSocket>) {
@@ -374,6 +377,46 @@ mod tests {
         assert_eq!(ask("10.42.1.10", "ubuntu.com", TYPE_A), Reply::Forward);
         assert_eq!(rcode_and_address(ask("192.168.68.50", "ubuntu.com", TYPE_A)), (5, None), "no open resolver");
         assert_eq!(rcode_and_address(ask("192.168.68.50", "k3s-1.lab.copper", TYPE_A)), (5, None));
+    }
+
+    /// Over real sockets, UDP and TCP. Linux puts all of 127.0.0.0/8 on
+    /// loopback, so two "VMs" in different projects can ask from their own
+    /// addresses without root.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn each_project_hears_only_its_own_names_over_udp_and_tcp() {
+        let project = |name: &str, vm: &str, address: &str| ProjectNetwork {
+            id: uuid::Uuid::new_v4(), name: name.into(), vms: vec![VmAddress { name: vm.into(), address: address.into() }],
+        };
+        let dns = Dns::new();
+        *dns.zone.write().unwrap() = Zone::from_map(&NetworkMap {
+            projects: vec![project("lab", "k3s-1", "127.0.0.2"), project("home", "backup", "127.0.0.3")], peers: vec![],
+        });
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let at = udp.local_addr().unwrap();
+        let tcp = TcpListener::bind(at).await.unwrap();
+        tokio::spawn(dns.clone().answer_on(udp, tcp));
+
+        let over_udp = |from: &'static str, name: &'static str| async move {
+            let s = UdpSocket::bind(format!("{from}:0")).await.unwrap();
+            s.send_to(&query(name, TYPE_A), at).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = tokio::time::timeout(Duration::from_secs(2), s.recv(&mut buf)).await.unwrap().unwrap();
+            rcode_and_address(Reply::Local(buf[..n].to_vec()))
+        };
+        assert_eq!(over_udp("127.0.0.2", "k3s-1.lab.copper").await, (0, Some(Ipv4Addr::new(127, 0, 0, 2))));
+        assert_eq!(over_udp("127.0.0.3", "k3s-1.lab.copper").await, (3, None), "home can't see lab");
+        assert_eq!(over_udp("127.0.0.3", "backup.home.copper").await, (0, Some(Ipv4Addr::new(127, 0, 0, 3))));
+        assert_eq!(over_udp("127.0.0.4", "backup.home.copper").await.0, 5, "not a VM: refused");
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.3:0".parse().unwrap()).unwrap();
+        let mut stream = socket.connect(at).await.unwrap();
+        write_framed(&mut stream, &query("backup.home.copper", TYPE_A)).await.unwrap();
+        let reply = read_framed(&mut stream).await.unwrap();
+        assert_eq!(rcode_and_address(Reply::Local(reply)), (0, Some(Ipv4Addr::new(127, 0, 0, 3))));
+        write_framed(&mut stream, &query("k3s-1.lab.copper", TYPE_A)).await.unwrap();
+        assert_eq!(rcode_and_address(Reply::Local(read_framed(&mut stream).await.unwrap())).0, 3, "and the same over TCP");
     }
 
     #[test]

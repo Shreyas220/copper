@@ -104,6 +104,12 @@ write() { # NODE N PROJECTS PEERS
 EOF
   mv "$tmp/$1/next.json" "$tmp/$1/network.json"
 }
+# na and nb miss each other on the LAN at first, as after a power cut when
+# everything boots at once: they settle on the tailnet, and have to find
+# their way back to the LAN once it answers.
+on na nft add table inet blocklan
+on na nft add chain inet blocklan in '{ type filter hook input priority -10; }'
+on na nft add rule inet blocklan in iifname eth0 udp dport 51820 drop
 # nc's last known LAN address is the decoy's: a wrong guess, like another
 # site using the same range.
 write na 1 "$lab" "$(peer nb "$kb" 2 192.168.10.2), $(peer nc "$kc" 3 192.168.10.3)"
@@ -119,8 +125,11 @@ for p in json.load(open(sys.argv[1])).get("peers", []):
 ' "$tmp/$1/net-status.json" "$2"
 }
 path_is() { [ "$(via "$1" "$2")" = "$3" ]; }
+for _ in $(seq 30); do path_is na "$kb" tailnet && path_is nb "$ka" tailnet && break; sleep 1; done
+expect_early=$(path_is na "$kb" tailnet && path_is nb "$ka" tailnet && echo yes || echo no)
+on na nft delete table inet blocklan
 settled() { path_is na "$kb" lan && path_is nb "$ka" lan && path_is na "$kc" tailnet && path_is nc "$ka" tailnet && path_is nb "$kc" tailnet; }
-for _ in $(seq 60); do settled && break; sleep 1; done
+for _ in $(seq 120); do settled && break; sleep 1; done
 
 listen() {
   space=$1 addr=$2 port=$3
@@ -150,7 +159,8 @@ expect() {
 for v in va:10.42.1.10 vb:10.42.2.10 vc:10.42.3.10 vh:10.42.3.11; do listen "${v%%:*}" "${v#*:}" 22; done
 sleep 1
 
-expect yes "nodes on the same LAN talk directly" path_is na "$kb" lan
+expect yes "nodes that miss each other on the LAN fall back to the tailnet" test "$expect_early" = yes
+expect yes "  and find the LAN once it answers" path_is na "$kb" lan
 expect yes "  both ways" path_is nb "$ka" lan
 expect yes "a node elsewhere is reached over the tailnet" path_is na "$kc" tailnet
 expect yes "  both ways" path_is nc "$ka" tailnet

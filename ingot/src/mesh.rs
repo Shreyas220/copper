@@ -28,6 +28,10 @@ const TRY_FOR: Duration = Duration::from_secs(8);
 /// WireGuard rekeys every 2 minutes while packets flow, and keepalives make
 /// sure they do. A handshake older than this means the path broke.
 const STALE_AFTER: u64 = 200;
+/// On a worse path than the first, check this often whether the first
+/// answers a ping now; each check that doesn't pan out doubles the wait.
+const PROBE_FIRST: Duration = Duration::from_secs(30);
+const PROBE_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// What `ingot net` tells ingot about the mesh, in `<run dir>/net-status.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +74,11 @@ struct PathChoice {
     since: Instant,
     /// A handshake has completed on `current`.
     settled: bool,
+    /// While giving the first endpoint another go: the one that worked, to
+    /// go straight back to if the first still doesn't complete a handshake.
+    back_to: Option<usize>,
+    next_probe: Instant,
+    probe_every: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -77,33 +86,67 @@ enum Step {
     Stay,
     /// Configure this endpoint afresh, so it has to complete a handshake.
     Try(usize),
+    /// See whether the first endpoint answers a ping; `answered` says.
+    Probe,
 }
 
 impl PathChoice {
     fn new(now: Instant, now_unix: u64) -> Self {
-        Self { current: 0, since_unix: now_unix, since: now, settled: false }
+        Self { current: 0, since_unix: now_unix, since: now, settled: false, back_to: None, next_probe: now + PROBE_FIRST, probe_every: PROBE_FIRST }
+    }
+
+    /// Switch to endpoint `i`, unsettled, keeping the probing schedule.
+    fn switch(&mut self, i: usize, now: Instant, now_unix: u64) -> Step {
+        *self = Self { current: i, since_unix: now_unix, since: now, settled: false, ..self.clone() };
+        Step::Try(i)
+    }
+
+    fn backoff(&mut self, now: Instant) {
+        self.probe_every = (self.probe_every * 2).min(PROBE_MAX);
+        self.next_probe = now + self.probe_every;
     }
 
     fn step(&mut self, endpoints: usize, handshake: Option<u64>, now: Instant, now_unix: u64) -> Step {
         if endpoints == 0 {
             return Step::Stay;
         }
-        let next = |p: &mut Self, i: usize| {
-            *p = Self { current: i, ..Self::new(now, now_unix) };
-            Step::Try(i)
-        };
         if !self.settled {
             if handshake.is_some_and(|t| t >= self.since_unix) {
                 self.settled = true;
+                if self.back_to.take().is_some() || self.current == 0 {
+                    self.probe_every = PROBE_FIRST;
+                }
                 Step::Stay
             } else if now.duration_since(self.since) >= TRY_FOR {
-                next(self, (self.current + 1) % endpoints)
+                match self.back_to.take() {
+                    // The first still doesn't answer: back to what worked, and wait longer next time.
+                    Some(back) => {
+                        self.backoff(now);
+                        self.switch(back, now, now_unix)
+                    }
+                    None => self.switch((self.current + 1) % endpoints, now, now_unix),
+                }
             } else {
                 Step::Stay
             }
         } else if handshake.is_none_or(|t| now_unix.saturating_sub(t) > STALE_AFTER) {
-            next(self, 0)
+            self.back_to = None;
+            self.switch(0, now, now_unix)
+        } else if self.current > 0 && now >= self.next_probe {
+            Step::Probe
         } else {
+            Step::Stay
+        }
+    }
+
+    /// The result of a `Probe`. Only a reply is worth disturbing a working
+    /// path for, and only a handshake on the first then settles it.
+    fn answered(&mut self, reply: bool, now: Instant, now_unix: u64) -> Step {
+        if reply {
+            self.back_to = Some(self.current);
+            self.switch(0, now, now_unix)
+        } else {
+            self.backoff(now);
             Step::Stay
         }
     }
@@ -185,8 +228,13 @@ impl Mesh {
         let mut peers = vec![];
         for (key, (peer, path)) in &mut self.peers {
             let (endpoint, handshake) = present.get(key).cloned().unwrap_or((None, None));
-            if let Step::Try(i) = path.step(peer.endpoints.len(), handshake, now, now_unix) {
-                tracing::info!(peer = %key, endpoint = %peer.endpoints[i].0, "trying the next path to a peer");
+            let mut step = path.step(peer.endpoints.len(), handshake, now, now_unix);
+            if step == Step::Probe {
+                let first = peer.endpoints[0].0;
+                step = path.answered(pings(*first.ip()), now, now_unix);
+            }
+            if let Step::Try(i) = step {
+                tracing::info!(peer = %key, endpoint = %peer.endpoints[i].0, "trying another path to a peer");
                 set_peer(peer, i)?;
             }
             let fresh = handshake.is_some_and(|t| now_unix.saturating_sub(t) <= STALE_AFTER);
@@ -209,6 +257,15 @@ fn set_peer(peer: &Peer, i: usize) -> anyhow::Result<()> {
     }
     run("wg", &args, None)?;
     Ok(())
+}
+
+/// Whether `ip` answers one ping within a second. Only a hint: a device at
+/// another site with the same address answers too, and then the WireGuard
+/// handshake that follows decides.
+fn pings(ip: Ipv4Addr) -> bool {
+    std::process::Command::new("ping").args(["-c", "1", "-W", "1", &ip.to_string()])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().is_ok_and(|s| s.success())
 }
 
 /// `wg show copper-wg dump`: each peer's current endpoint and last handshake.
@@ -302,23 +359,54 @@ fn run(cmd: &str, args: &[&str], input: Option<&str>) -> anyhow::Result<String> 
 mod tests {
     use super::*;
 
+    /// Seconds after a start at unix time 1000.
+    fn at(t0: Instant, s: u64) -> (Instant, u64) {
+        (t0 + Duration::from_secs(s), 1000 + s)
+    }
+
     #[test]
     fn each_endpoint_gets_its_chance_until_one_answers() {
         let t0 = Instant::now();
+        let step = |p: &mut PathChoice, handshake: Option<u64>, s| { let (t, u) = at(t0, s); p.step(2, handshake, t, u) };
         let mut p = PathChoice::new(t0, 1000);
-        assert_eq!(p.step(2, None, t0 + Duration::from_secs(3), 1003), Step::Stay, "still waiting on the LAN");
-        assert_eq!(p.step(2, None, t0 + Duration::from_secs(9), 1009), Step::Try(1), "the LAN didn't answer: the tailnet");
+        assert_eq!(step(&mut p, None, 3), Step::Stay, "still waiting on the LAN");
+        assert_eq!(step(&mut p, None, 9), Step::Try(1), "the LAN didn't answer: the tailnet");
         // An old handshake from before the switch doesn't count.
-        assert_eq!(p.step(2, Some(1004), t0 + Duration::from_secs(12), 1012), Step::Stay);
+        assert_eq!(step(&mut p, Some(1004), 12), Step::Stay);
         assert!(!p.settled);
-        assert_eq!(p.step(2, Some(1013), t0 + Duration::from_secs(14), 1014), Step::Stay);
-        assert!(p.settled);
-        assert_eq!(p.current, 1);
-        // It stays while handshakes keep coming, and starts over from the LAN when they stop.
-        assert_eq!(p.step(2, Some(1130), t0 + Duration::from_secs(150), 1150), Step::Stay);
-        assert_eq!(p.step(2, Some(1130), t0 + Duration::from_secs(400), 1400), Step::Try(0));
-        assert_eq!(p.step(2, None, t0 + Duration::from_secs(409), 1409), Step::Try(1));
-        assert_eq!(p.step(2, None, t0 + Duration::from_secs(418), 1418), Step::Try(0), "and round again until something answers");
+        assert_eq!(step(&mut p, Some(1013), 14), Step::Stay);
+        assert!(p.settled && p.current == 1);
+        assert_eq!(step(&mut p, Some(1018), 20), Step::Stay, "it stays while handshakes keep coming");
+        // ...and starts over from the LAN when they stop.
+        assert_eq!(step(&mut p, Some(1018), 220), Step::Try(0));
+        assert_eq!(step(&mut p, None, 229), Step::Try(1));
+        assert_eq!(step(&mut p, None, 238), Step::Try(0), "and round again until something answers");
+    }
+
+    #[test]
+    fn a_peer_on_the_tailnet_gets_back_to_the_lan_once_the_lan_answers() {
+        let t0 = Instant::now();
+        let step = |p: &mut PathChoice, handshake: Option<u64>, s| { let (t, u) = at(t0, s); p.step(2, handshake, t, u) };
+        let answered = |p: &mut PathChoice, reply: bool, s| { let (t, u) = at(t0, s); p.answered(reply, t, u) };
+        // Both nodes started at once and missed each other on the LAN.
+        let mut p = PathChoice::new(t0, 1000);
+        assert_eq!(step(&mut p, None, 9), Step::Try(1));
+        assert_eq!(step(&mut p, Some(1010), 10), Step::Stay);
+        assert_eq!(step(&mut p, Some(1030), 31), Step::Probe, "30 s on, see whether the LAN answers");
+        assert_eq!(answered(&mut p, false, 31), Step::Stay, "it doesn't: stay, and wait 60 s");
+        assert_eq!(step(&mut p, Some(1060), 61), Step::Stay);
+        assert_eq!(step(&mut p, Some(1090), 92), Step::Probe);
+        // It answers a ping but not WireGuard: straight back, not round the list.
+        assert_eq!(answered(&mut p, true, 92), Step::Try(0));
+        assert_eq!(step(&mut p, None, 101), Step::Try(1));
+        assert_eq!(p.probe_every, Duration::from_secs(120));
+        assert_eq!(step(&mut p, Some(1102), 102), Step::Stay);
+        // Next time it completes a handshake too: the LAN it is.
+        assert_eq!(step(&mut p, Some(1200), 223), Step::Probe);
+        assert_eq!(answered(&mut p, true, 223), Step::Try(0));
+        assert_eq!(step(&mut p, Some(1224), 224), Step::Stay);
+        assert!(p.settled && p.current == 0 && p.probe_every == PROBE_FIRST);
+        assert_eq!(step(&mut p, Some(1300), 400), Step::Stay, "nothing better to look for");
     }
 
     #[test]

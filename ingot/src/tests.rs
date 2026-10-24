@@ -202,7 +202,8 @@ async fn worker_reports_old_failures_without_overwriting_new_desired_state() {
     let (client, mut calls) = mpsc::unbounded_channel();
     let (updates, state) = watch::channel(ControllerState { revision: 1, desired: Some(snapshot()) });
     let (failures, mut errors) = mpsc::channel(1);
-    let task = tokio::spawn(reconcile_loop(ScriptedClient(client), state, failures, reconciler, net::Writer::new(dir.path())));
+    let network = Network { file: net::Writer::new(dir.path()), dns: dns::Dns::new() };
+    let task = tokio::spawn(reconcile_loop(ScriptedClient(client), state, failures, reconciler, network));
     let (_, reply) = observed(&mut calls).await;
     updates.send_replace(ControllerState { revision: 2, desired: Some(snapshot()) });
     reply.send(Err(anyhow::anyhow!("old report failed"))).unwrap();

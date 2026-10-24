@@ -100,12 +100,14 @@ struct DesiredQuery {
 fn read_desired(state: &AppState, id: NodeId, headers: &HeaderMap) -> Result<DesiredNodeState> {
     let conn = state.db.lock().unwrap();
     let node = authenticate(&conn, id, headers)?;
-    let instances = db::list_instances_on_node(&conn, id)?
-        .into_iter()
-        .map(|r| DesiredInstance { id: r.id, name: r.name, state: r.desired, spec: r.spec })
-        .collect();
     let network = node.subnet.map(|n| state.vm_net.node(n));
     let map = db::network_map(&conn, id)?;
+    // Every project with a VM here is in the map.
+    let project = |p| map.projects.iter().find(|n| n.id == p).map(|n| n.name.clone()).unwrap_or_default();
+    let instances = db::list_instances_on_node(&conn, id)?
+        .into_iter()
+        .map(|r| DesiredInstance { id: r.id, project: project(r.project_id), name: r.name, state: r.desired, spec: r.spec })
+        .collect();
     Ok(DesiredNodeState { generation: node.generation, instances, network, map })
 }
 

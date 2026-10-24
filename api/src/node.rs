@@ -162,6 +162,10 @@ pub struct DesiredInstance {
     pub id: InstanceId,
     /// User-chosen name; becomes the guest hostname.
     pub name: String,
+    /// Its project's name: the guest's DNS search domain is
+    /// `<project>.copper`, so other VMs in it resolve by name alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project: String,
     pub state: DesiredState,
     pub spec: InstanceSpec,
 }

@@ -78,7 +78,7 @@ impl Disks {
     }
 
     /// Create the cloud-init seed if it does not exist. Idempotent.
-    pub fn ensure_seed(&self, id: InstanceId, name: &str, spec: &InstanceSpec) -> anyhow::Result<PathBuf> {
+    pub fn ensure_seed(&self, id: InstanceId, name: &str, project: &str, spec: &InstanceSpec) -> anyhow::Result<PathBuf> {
         let path = self.seed_path(id);
         if path.exists() {
             return Ok(path);
@@ -91,7 +91,7 @@ impl Disks {
         let tmp = path.with_extension("iso.tmp");
         let mut localds = Command::new("cloud-localds");
         // On a copper network the guest gets its fixed address this way.
-        let network = crate::vmnet::network_config(&spec.nics).map(|config| (self.dir.join(format!("{id}-network-config")), config));
+        let network = crate::vmnet::network_config(&spec.nics, project).map(|config| (self.dir.join(format!("{id}-network-config")), config));
         if let Some((file, config)) = &network {
             std::fs::write(file, config)?;
             localds.arg("--network-config").arg(file);

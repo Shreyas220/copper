@@ -344,7 +344,7 @@ impl Hypervisor for Libvirt {
     fn allocatable_gb(&self, ids: &[InstanceId]) -> u64 { self.disks.allocatable_gb(ids.iter().copied()) }
     fn prepare(&self, inst: &DesiredInstance) -> anyhow::Result<()> {
         self.disks.ensure_disk(inst.id, &inst.spec)?;
-        self.disks.ensure_seed(inst.id, &inst.name, &inst.spec)?;
+        self.disks.ensure_seed(inst.id, &inst.name, &inst.project, &inst.spec)?;
         Ok(())
     }
     fn has_storage(&self, id: InstanceId) -> bool { self.disks.disk_exists(id) }

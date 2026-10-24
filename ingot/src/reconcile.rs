@@ -331,7 +331,7 @@ mod tests {
     }
     fn snapshot(state: DesiredState) -> DesiredNodeState {
         DesiredNodeState { generation: 7, instances: vec![DesiredInstance {
-            id: InstanceId::new_v4(), name: "vm".into(), state,
+            id: InstanceId::new_v4(), name: "vm".into(), project: "default".into(), state,
             spec: InstanceSpec {
                 vcpus: 1, memory_mb: 1024, arch: Arch::X86_64,
                 boot_disk: BootDisk { image: "ubuntu".into(), sha256: None, size_gb: 10 },

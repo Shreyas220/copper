@@ -3,6 +3,7 @@
 
 mod client;
 mod disk;
+mod dns;
 #[cfg(not(target_os = "macos"))]
 mod host;
 mod hv;
@@ -43,7 +44,7 @@ struct Opts {
     kiln: String,
     /// State directory: node id, cached desired state, disks.
     /// systemd's StateDirectory gives /var/lib/copper.
-    #[arg(long, env = "INGOT_STATE_DIR", default_value = "/var/lib/copper")]
+    #[arg(long, env = "INGOT_STATE_DIR", default_value = "/var/lib/copper", global = true)]
     state_dir: PathBuf,
     /// Base images, one <name>.img per image.
     #[arg(long, env = "INGOT_IMAGES_DIR")]
@@ -148,10 +149,11 @@ async fn run() -> anyhow::Result<()> {
 
     let (updates, rx) = tokio::sync::watch::channel(ControllerState::default());
     let (failures, errors) = tokio::sync::mpsc::channel(1);
-    let netfile = net::Writer::new(&opts.state_dir);
+    let network = Network { file: net::Writer::new(&opts.state_dir), dns: dns::Dns::new() };
+    tokio::spawn(network.dns.clone().serve());
     tokio::select! {
         result = desired_loop(kiln.clone(), opts.state_dir, cached, register, updates, errors) => result,
-        result = reconcile_loop(kiln, rx, failures, reconciler, netfile) => result,
+        result = reconcile_loop(kiln, rx, failures, reconciler, network) => result,
     }
 }
 
@@ -280,7 +282,7 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
     mut rx: tokio::sync::watch::Receiver<ControllerState>,
     failures: tokio::sync::mpsc::Sender<ReportFailure>,
     reconciler: Arc<Mutex<Reconciler<H>>>,
-    mut netfile: net::Writer,
+    mut network: Network,
 ) -> anyhow::Result<()> {
     let mut timer = tokio::time::interval(REPORT_EVERY);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -294,12 +296,8 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
         }
         ready = false;
         let controller = rx.borrow_and_update().clone();
-        // What the root helper should apply: written only from a fresh,
-        // authorized desired state, like every other change.
         if let Some(d) = &controller.desired {
-            if let Some(network) = &d.network {
-                netfile.update(net::NetFile::new(d.generation, network.clone(), &d.map, None));
-            }
+            network.update(d);
         }
         let Some(report) = reconcile_snapshot(reconciler.clone(), controller.desired).await? else { continue };
         if let Err(error) = kiln.observed(&report).await {
@@ -309,6 +307,22 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
             rx.changed().await?;
             ready = true;
         }
+    }
+}
+
+/// The node's side of copper's network outside the hypervisor: the names
+/// ingot answers, and the file the root helper applies.
+struct Network {
+    file: net::Writer,
+    dns: Arc<dns::Dns>,
+}
+
+impl Network {
+    /// Only from a fresh, authorized desired state, like every other change.
+    fn update(&mut self, d: &DesiredNodeState) {
+        let Some(node) = &d.network else { return };
+        self.dns.update(node, &d.map);
+        self.file.update(net::NetFile::new(d.generation, node.clone(), &d.map, self.dns.listening()));
     }
 }
 

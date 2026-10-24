@@ -1,16 +1,19 @@
 [Unit]
-Description=copper VM networks, host side: NAT to the internet, nothing private
+Description=copper VM networks, host side: NAT, walls between projects, DNS for VMs
 Documentation=https://github.com/Shreyas220/copper/blob/main/docs/design.md#networking
 # After Docker, so its DOCKER-USER chain exists to add to.
 After=network-online.target docker.service
 Before=ingot.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-EnvironmentFile=-/etc/copper/net.env
-ExecStart=/usr/local/lib/copper/copper-net start
-ExecStop=/usr/local/lib/copper/copper-net stop
+# Root, because it changes the host's firewall; ingot itself never runs as
+# root. It applies <state dir>/network.json, which ingot writes, and only
+# rules about copper's own interfaces and addresses.
+Environment=INGOT_STATE_DIR=/var/lib/copper
+ExecStart=/usr/local/bin/ingot net
+ExecStopPost=/usr/local/bin/ingot net --stop
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

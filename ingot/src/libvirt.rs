@@ -361,7 +361,7 @@ impl Hypervisor for Libvirt {
     fn addresses(&self, id: InstanceId) -> Vec<String> { self.addresses(id) }
     fn copper_network(&self) -> bool { true }
     fn ensure_network(&self, net: &NodeNetwork) -> anyhow::Result<()> { self.ensure_network(net) }
-    fn network_ready(&self) -> Option<bool> { Some(Path::new(vmnet::READY_FILE).exists()) }
+    fn network_ready(&self) -> Option<bool> { Some(Path::new(crate::net::READY_FILE).exists()) }
     fn usage(&self, id: InstanceId) -> Option<Usage> { self.usage(id) }
     fn host_usage(&self) -> Option<Usage> { self.host.read() }
 }
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn the_network_adds_no_firewall_rules_of_its_own() {
-        let x = network_xml(&NodeNetwork { subnet: "10.42.1.0/24".into(), gateway: "10.42.1.1".into() }).unwrap();
+        let x = network_xml(&NodeNetwork { subnet: "10.42.1.0/24".into(), gateway: "10.42.1.1".into(), space: "10.42.0.0/16".into() }).unwrap();
         assert!(x.contains("<name>copper-10.42.1.0-24</name>"));
         assert!(x.contains("<forward mode='open'/>"));
         assert!(x.contains("<bridge name='cu-42-1'"));

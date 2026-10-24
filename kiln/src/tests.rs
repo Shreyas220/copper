@@ -135,7 +135,7 @@ async fn nodes_get_a_subnet_and_vms_a_fixed_address_in_it() {
     let nic = &f.instance_row("a").spec.nics[0];
     assert_eq!((nic.address.as_deref(), nic.bridge.as_str()), (Some("10.42.1.10/24"), ""));
     let (_, desired) = f.call("GET", &format!("/nodes/{}/desired", f.node), &f.secret, Value::Null).await;
-    assert_eq!(desired["network"], json!({"subnet": "10.42.1.0/24", "gateway": "10.42.1.1"}));
+    assert_eq!(desired["network"], json!({"subnet": "10.42.1.0/24", "gateway": "10.42.1.1", "space": "10.42.0.0/16"}));
     // A node approved later gets the next one; numbers are never reused.
     let id = NodeId::new_v4();
     let token = "c".repeat(64);

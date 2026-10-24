@@ -1,15 +1,12 @@
 //! The node's side of copper's network. Kiln gives the node a /24 and each
 //! VM a fixed address in it; this names the pieces and writes the guest's
-//! network config. The host side (NAT to the internet, nothing private) is
-//! `copper-net.service`, installed by `install.sh ingot`, because it needs
-//! root and ingot doesn't run as root.
+//! network config. The host side (NAT, the walls between projects, the DNS
+//! redirect) is `ingot net` (see `net.rs`), run as root by copper-net.service
+//! because ingot itself doesn't run as root.
 
 use std::net::Ipv4Addr;
 
 use copper_api::{Nic, NodeNetwork};
-
-/// Written by copper-net.service once its rules are in place.
-pub const READY_FILE: &str = "/run/copper/net-ready";
 
 /// Every VM's MTU: Tailscale carries 1280, less WireGuard's 60 for the mesh
 /// between nodes. The same everywhere, because a VM can't change its MTU when
@@ -35,7 +32,7 @@ pub fn parse(address: &str) -> Option<(Ipv4Addr, NodeNetwork)> {
         return None;
     }
     let [a, b, c, _] = ip.octets();
-    Some((ip, NodeNetwork { subnet: format!("{a}.{b}.{c}.0/24"), gateway: format!("{a}.{b}.{c}.1") }))
+    Some((ip, NodeNetwork { subnet: format!("{a}.{b}.{c}.0/24"), gateway: format!("{a}.{b}.{c}.1"), space: format!("{a}.{b}.0.0/16") }))
 }
 
 /// The VM's copper address, for the NIC that has one.
@@ -69,10 +66,10 @@ mod tests {
 
     #[test]
     fn names_follow_the_subnet() {
-        let net = NodeNetwork { subnet: "10.42.7.0/24".into(), gateway: "10.42.7.1".into() };
+        let net = NodeNetwork { subnet: "10.42.7.0/24".into(), gateway: "10.42.7.1".into(), space: "10.42.0.0/16".into() };
         assert_eq!(libvirt_name(&net.subnet), "copper-10.42.7.0-24");
         assert_eq!(bridge_name(&net).as_deref(), Some("cu-42-7"));
-        assert!(bridge_name(&NodeNetwork { subnet: "10.255.254.0/24".into(), gateway: String::new() }).unwrap().len() <= 15);
+        assert!(bridge_name(&NodeNetwork { subnet: "10.255.254.0/24".into(), gateway: String::new(), space: String::new() }).unwrap().len() <= 15);
     }
 
     #[test]

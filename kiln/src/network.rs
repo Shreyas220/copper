@@ -29,7 +29,11 @@ impl VmNet {
 
     /// Node `n`'s part: `10.42.n.0/24`, with the node at `.1`.
     pub fn node(&self, n: u8) -> NodeNetwork {
-        NodeNetwork { subnet: format!("{}.{}.{n}.0/24", self.a, self.b), gateway: format!("{}.{}.{n}.1", self.a, self.b) }
+        NodeNetwork {
+            subnet: format!("{}.{}.{n}.0/24", self.a, self.b),
+            gateway: format!("{}.{}.{n}.1", self.a, self.b),
+            space: format!("{}.{}.0.0/16", self.a, self.b),
+        }
     }
 
     /// The lowest address in node `n`'s /24 that none of `taken` (addresses
@@ -65,7 +69,7 @@ mod tests {
     #[test]
     fn addresses_fill_from_ten_and_come_back() {
         let net = VmNet::default();
-        assert_eq!(net.node(3), NodeNetwork { subnet: "10.42.3.0/24".into(), gateway: "10.42.3.1".into() });
+        assert_eq!(net.node(3), NodeNetwork { subnet: "10.42.3.0/24".into(), gateway: "10.42.3.1".into(), space: "10.42.0.0/16".into() });
         assert_eq!(net.allocate(1, [].into_iter()).as_deref(), Some("10.42.1.10/24"));
         let taken = ["10.42.1.10/24", "10.42.1.11/24", "10.42.2.12/24"];
         assert_eq!(net.allocate(1, taken.into_iter()).as_deref(), Some("10.42.1.12/24"), "another node's addresses don't count");

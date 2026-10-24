@@ -10,6 +10,7 @@ mod identity;
 mod images;
 #[cfg(not(target_os = "macos"))]
 mod libvirt;
+mod net;
 mod reconcile;
 mod sessions;
 mod state;
@@ -58,6 +59,23 @@ struct Opts {
     /// Disk space kept back for the host, in GiB.
     #[arg(long, env = "INGOT_RESERVE_DISK_GB", default_value_t = 0)]
     reserve_disk_gb: u64,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+enum Cmd {
+    /// Apply the node's VM network as root, as copper-net.service does: NAT,
+    /// the walls between projects, the DNS redirect. Re-applies whenever
+    /// ingot rewrites `<state dir>/network.json`.
+    Net {
+        /// Apply once and exit.
+        #[arg(long)]
+        once: bool,
+        /// Take copper's rules out and exit.
+        #[arg(long, conflicts_with = "once")]
+        stop: bool,
+    },
 }
 
 const REPORT_EVERY: Duration = Duration::from_secs(10);
@@ -91,6 +109,10 @@ async fn run() -> anyhow::Result<()> {
         )
         .init();
     let opts = Opts::parse();
+    if let Some(Cmd::Net { once, stop }) = opts.cmd {
+        let state_dir = opts.state_dir.clone();
+        return tokio::task::spawn_blocking(move || if stop { net::stop() } else { net::run(&state_dir, once) }).await?;
+    }
     std::fs::create_dir_all(&opts.state_dir).with_context(|| format!("creating {}", opts.state_dir.display()))?;
     let images_dir = opts.images_dir.clone().unwrap_or_else(|| opts.state_dir.join("images"));
 
@@ -126,9 +148,10 @@ async fn run() -> anyhow::Result<()> {
 
     let (updates, rx) = tokio::sync::watch::channel(ControllerState::default());
     let (failures, errors) = tokio::sync::mpsc::channel(1);
+    let netfile = net::Writer::new(&opts.state_dir);
     tokio::select! {
         result = desired_loop(kiln.clone(), opts.state_dir, cached, register, updates, errors) => result,
-        result = reconcile_loop(kiln, rx, failures, reconciler) => result,
+        result = reconcile_loop(kiln, rx, failures, reconciler, netfile) => result,
     }
 }
 
@@ -257,6 +280,7 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
     mut rx: tokio::sync::watch::Receiver<ControllerState>,
     failures: tokio::sync::mpsc::Sender<ReportFailure>,
     reconciler: Arc<Mutex<Reconciler<H>>>,
+    mut netfile: net::Writer,
 ) -> anyhow::Result<()> {
     let mut timer = tokio::time::interval(REPORT_EVERY);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -270,6 +294,13 @@ async fn reconcile_loop<H: hv::Hypervisor + Send + 'static>(
         }
         ready = false;
         let controller = rx.borrow_and_update().clone();
+        // What the root helper should apply: written only from a fresh,
+        // authorized desired state, like every other change.
+        if let Some(d) = &controller.desired {
+            if let Some(network) = &d.network {
+                netfile.update(net::NetFile::new(d.generation, network.clone(), &d.map, None));
+            }
+        }
         let Some(report) = reconcile_snapshot(reconciler.clone(), controller.desired).await? else { continue };
         if let Err(error) = kiln.observed(&report).await {
             failures.send(ReportFailure { revision: controller.revision, error }).await?;

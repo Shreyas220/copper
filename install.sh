@@ -159,18 +159,18 @@ case "$role" in
       printf 'INGOT_KILN=%s\n' "$kiln_url" > "$CONF_DIR/ingot.env"
       fetch_unit ingot.service
       install -m 644 "$tmp/ingot.service" /etc/systemd/system/ingot.service
-      # The host side of copper's VM network: NAT to the internet, nothing
-      # private. It needs root, which ingot doesn't have.
-      fetch_unit copper-net
+      # The host side of copper's VM network, `ingot net` as root: NAT, walls
+      # between projects, DNS for VMs. ingot itself never runs as root.
       fetch_unit copper-net.service
-      install -d -m 755 /usr/local/lib/copper
-      install -m 755 "$tmp/copper-net" /usr/local/lib/copper/copper-net
       install -m 644 "$tmp/copper-net.service" /etc/systemd/system/copper-net.service
+      # The shell script it replaces.
+      rm -f /usr/local/lib/copper/copper-net
+      rmdir /usr/local/lib/copper 2>/dev/null || true
     else
       echo "+ write $CONF_DIR/ingot.env (INGOT_KILN=$kiln_url)"; echo "+ install /etc/systemd/system/ingot.service"
-      echo "+ install /usr/local/lib/copper/copper-net and /etc/systemd/system/copper-net.service"
+      echo "+ install /etc/systemd/system/copper-net.service"
     fi
-    say "enabling copper-net.service (VM networks: NAT to the internet, no access to the LAN, the tailnet or this host)"
+    say "enabling copper-net.service (VM networks: NAT, walls between projects, no access to the LAN, the tailnet or this host)"
     run systemctl daemon-reload
     run systemctl enable copper-net.service
     run systemctl restart copper-net.service

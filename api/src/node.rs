@@ -96,6 +96,13 @@ pub struct NodeNetwork {
     pub subnet: String,
     /// `10.42.1.1`
     pub gateway: String,
+    /// All of copper's VM addresses, every node's /24 included: `10.42.0.0/16`.
+    #[serde(default = "default_space")]
+    pub space: String,
+}
+
+fn default_space() -> String {
+    "10.42.0.0/16".into()
 }
 
 impl NodeNetwork {

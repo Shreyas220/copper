@@ -198,12 +198,11 @@ impl hv::Hypervisor for EmptyHypervisor {
 #[tokio::test]
 async fn worker_reports_old_failures_without_overwriting_new_desired_state() {
     let dir = test_support::TempDir::new();
-    let _ = &dir;
     let reconciler = Arc::new(Mutex::new(Reconciler::new(EmptyHypervisor, Capacity { vcpus: 0, memory_mb: 0, disk_gb: 0 })));
     let (client, mut calls) = mpsc::unbounded_channel();
     let (updates, state) = watch::channel(ControllerState { revision: 1, desired: Some(snapshot()) });
     let (failures, mut errors) = mpsc::channel(1);
-    let task = tokio::spawn(reconcile_loop(ScriptedClient(client), state, failures, reconciler));
+    let task = tokio::spawn(reconcile_loop(ScriptedClient(client), state, failures, reconciler, net::Writer::new(dir.path())));
     let (_, reply) = observed(&mut calls).await;
     updates.send_replace(ControllerState { revision: 2, desired: Some(snapshot()) });
     reply.send(Err(anyhow::anyhow!("old report failed"))).unwrap();

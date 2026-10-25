@@ -4,7 +4,7 @@ Goals for copper, in the order they make sense to build. [design.md](design.md) 
 
 ## Near term, finishing what exists
 
-- [ ] Test and fix the Tart backend on the mini. Waiting for the hardware. CI now compiles it and runs the unit tests on macOS; it has never driven a real Tart VM. Then take the preview tag off the landing page.
+- [x] Test and fix the Tart backend on the mini: it boots, reaches and deletes real Tart VMs now. Still to do: take the preview tag off the landing page.
 - [x] A launchd-aware macOS section in the docs.
 - [x] Install on the laptop for real with the systemd units, so kiln and ingot stop being dev processes.
 - [x] LAN binding for kiln: several listen addresses and `install.sh kiln --lan`, with a warning for plain HTTP outside loopback and the tailnet. Kept for odd setups; copper itself now runs on the tailnet.
@@ -25,8 +25,9 @@ One architecture wherever a node is: on the home router or anywhere on the tailn
 - [x] Projects are walls: VMs only reach VMs in their own project.
 - [x] Names: `<vm>.<project>.copper` from ingot's DNS on each gateway, per project.
 - [x] A root helper (`ingot net`) applies each node's network from a file ingot writes, replacing the `copper-net` script.
-- [x] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path. Tested with three nodes in namespaces in CI; on real nodes once a second Linux node or the Mac mini joins.
-- [ ] Tart nodes on copper networks: the Mac's VM network on the node's /24, pf rules, private ports, `wireguard-go`. Tested by hand on the Mac mini first.
+- [x] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path. Tested with three nodes in namespaces in CI, and between the laptop and the Mac mini over their LAN and, with the LAN blocked, the tailnet.
+- [x] Tart nodes on copper networks: the Mac's VM network on the node's /24, pf rules, private ports, `wireguard-go`, and the root helper answering DNS and carrying tunnels where macOS keeps ingot from its VMs.
+- [ ] Check whether a peer's LAN answers without dropping the path that works. Today a probe switches over and waits for a handshake, so where another device answers at a peer's LAN address the two nodes lose each other for about 10 s at each probe, every 30 minutes once backed off.
 - [ ] A jump host in kiln, so plain `ssh` reaches a VM by name without cu.
 
 ## Scheduling and capacity

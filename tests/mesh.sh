@@ -171,7 +171,8 @@ expect yes "a VM reaches its project on a node elsewhere" reaches va 10.42.3.10 
 expect yes "  and back" reaches vc 10.42.1.10 22
 expect no  "a VM can't reach another project on another node" reaches va 10.42.3.11 22
 expect no  "  nor the other way" reaches vh 10.42.1.10 22
-expect yes "1220-byte packets fit over the tailnet" on va ping -c 1 -W 2 -M do -s 1192 10.42.3.10
+# Three tries: one lost ping isn't an MTU problem, and a path too small drops them all.
+expect yes "1220-byte packets fit over the tailnet" on va ping -c 3 -W 2 -M do -s 1192 10.42.3.10
 # nb borrows the address of a lab VM on nc; the walls would let it in, but
 # na only takes nb's own /24 from nb's key.
 on nb ip addr add 10.42.3.10/32 dev lo

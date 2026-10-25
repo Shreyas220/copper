@@ -13,6 +13,7 @@ mod images;
 mod libvirt;
 mod mesh;
 mod net;
+mod reach;
 mod reconcile;
 mod sessions;
 mod state;
@@ -112,7 +113,15 @@ async fn run() -> anyhow::Result<()> {
     let opts = Opts::parse();
     if let Some(Cmd::Net { once, stop }) = opts.cmd {
         let state_dir = opts.state_dir.clone();
-        return tokio::task::spawn_blocking(move || if stop { net::stop() } else { net::run(&state_dir, once) }).await?;
+        // A Mac's ingot can't reach its own VMs, so the helper does (reach.rs).
+        let host = if cfg!(target_os = "macos") && !stop && !once {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(&state_dir).with_context(|| format!("reading {}", state_dir.display()))?.uid();
+            Some(reach::Host::start(std::path::Path::new(reach::SOCKET), owner)?)
+        } else {
+            None
+        };
+        return tokio::task::spawn_blocking(move || if stop { net::stop() } else { net::run(&state_dir, once, host) }).await?;
     }
     std::fs::create_dir_all(&opts.state_dir).with_context(|| format!("creating {}", opts.state_dir.display()))?;
     let images_dir = opts.images_dir.clone().unwrap_or_else(|| opts.state_dir.join("images"));
@@ -150,7 +159,10 @@ async fn run() -> anyhow::Result<()> {
     let (updates, rx) = tokio::sync::watch::channel(ControllerState::default());
     let (failures, errors) = tokio::sync::mpsc::channel(1);
     let network = Network { file: net::Writer::new(&opts.state_dir), dns: dns::Dns::new() };
-    tokio::spawn(network.dns.clone().serve());
+    // On a Mac, `ingot net` answers instead (reach.rs).
+    if !cfg!(target_os = "macos") {
+        tokio::spawn(network.dns.clone().serve());
+    }
     tokio::select! {
         result = desired_loop(kiln.clone(), opts.state_dir, cached, register, updates, errors) => result,
         result = reconcile_loop(kiln, rx, failures, reconciler, network) => result,

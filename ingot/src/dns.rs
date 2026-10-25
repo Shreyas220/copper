@@ -1,5 +1,7 @@
 //! DNS for VMs, one project at a time. Ingot answers on its gateway, port
 //! `PORT`; `ingot net` redirects the VMs' port 53 there once it's listening.
+//! On a Mac `ingot net` answers itself, because macOS keeps ingot from
+//! replying to its VMs (see reach.rs).
 //!
 //! `<vm>.<project>.copper` resolves to the VM's address, but only for VMs in
 //! that project: the asker's own address says which project it's in, and

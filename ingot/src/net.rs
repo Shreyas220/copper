@@ -10,7 +10,8 @@
 //!   walls). VMs reach each other only through the host: their addresses are
 //!   /32s and their bridge ports are isolated.
 //! - Nothing else private: not the home LAN, the tailnet, link-local, or the
-//!   node itself except DNS, which is redirected to ingot when it answers.
+//!   node itself except DNS, which is redirected to ingot when it answers
+//!   (on a Mac, to `ingot net` itself: see reach.rs).
 //!
 //! Every rule matches only copper's interfaces (`cu-*` bridges on Linux,
 //! macOS's VM bridge), the mesh, or copper's range, so the host's own
@@ -28,6 +29,7 @@ use copper_api::{Generation, MeshPeer, NetworkMap, NodeNetwork, ProjectNetwork};
 use serde::{Deserialize, Serialize};
 
 use crate::mesh::{self, Mesh};
+use crate::reach;
 
 pub const FILE: &str = "network.json";
 /// Exists while copper's rules are in place; ingot reports it as
@@ -172,6 +174,11 @@ impl Plan {
         Ok(Self { space, subnet: Some(subnet), gateway: Some(gateway), walls, dns: file.dns, peers })
     }
 
+    /// The node's own VMs.
+    fn local_vms(&self) -> Vec<Ipv4Addr> {
+        self.walls.iter().flat_map(|w| w.local.iter().copied()).collect()
+    }
+
     /// The nftables script: declares the table first so deleting it is safe
     /// on a fresh boot, then replaces it whole, in one transaction.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -296,7 +303,9 @@ impl Writer {
 }
 
 /// `ingot net`: apply the file now and whenever it changes, until stopped.
-pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
+/// On a Mac, `host` answers the VMs' DNS and ingot's connections to them,
+/// from the same file (see reach.rs).
+pub fn run(state_dir: &Path, once: bool, host: Option<reach::Host>) -> anyhow::Result<()> {
     let path = state_dir.join(FILE);
     let paths = Paths::from_env();
     let mut mesh = Mesh::open(&paths.keys)?;
@@ -305,6 +314,7 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
     let mut status = None;
     let mut complained = None;
     let mut gateway = None;
+    let mut hosted_dns = None;
     loop {
         // macOS makes its VM bridge afresh whenever a VM starts after none
         // ran, without copper's gateway on it.
@@ -316,9 +326,18 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
             }
         }
         let stamp = std::fs::metadata(&path).ok().map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
-        if stamp != seen || applied_at.elapsed() >= REAPPLY_EVERY {
+        // Port 53 is redirected only once the helper's own DNS listens.
+        let dns_now = host.as_ref().and_then(|h| h.dns.listening());
+        if stamp != seen || dns_now != hosted_dns || applied_at.elapsed() >= REAPPLY_EVERY {
             let plan = match std::fs::read(&path) {
-                Ok(bytes) => serde_json::from_slice::<NetFile>(&bytes).map_err(anyhow::Error::from).and_then(|f| Plan::check(&f).map(|p| (f.generation, p))),
+                Ok(bytes) => serde_json::from_slice::<NetFile>(&bytes).map_err(anyhow::Error::from).and_then(|f| {
+                    let mut plan = Plan::check(&f)?;
+                    if let Some(host) = &host {
+                        host.update(&f.network, &f.projects, plan.local_vms());
+                        plan.dns = dns_now;
+                    }
+                    Ok((f.generation, plan))
+                }),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((0, Plan::base())),
                 Err(e) => Err(e.into()),
             };
@@ -339,6 +358,7 @@ pub fn run(state_dir: &Path, once: bool) -> anyhow::Result<()> {
                 Err(e) => tracing::error!(error = %format!("{e:#}"), "copper network not applied; keeping the previous rules"),
             }
             seen = stamp;
+            hosted_dns = dns_now;
             applied_at = std::time::Instant::now();
         }
         match mesh.tick() {
@@ -460,6 +480,7 @@ pub fn stop() -> anyhow::Result<()> {
     };
     if cfg!(target_os = "macos") {
         quiet("pfctl", &["-q", "-a", PF_ANCHOR, "-F", "all"]);
+        let _ = std::fs::remove_file(reach::SOCKET);
     } else {
         quiet("nft", &["delete", "table", "inet", "copper"]);
         docker_user(false);

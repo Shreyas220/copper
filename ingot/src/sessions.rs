@@ -52,9 +52,8 @@ async fn tcp(kiln: Kiln, reconciler: Arc<Mutex<Reconciler>>, req: ConsoleRequest
     let Some(ip) = target else {
         return refuse(&kiln, &req, "the vm has no address yet; it's still booting").await;
     };
-    let mut vm = match tokio::time::timeout(CONNECT, tokio::net::TcpStream::connect(SocketAddr::new(ip, port))).await {
-        Ok(Ok(stream)) => stream,
-        _ => return refuse(&kiln, &req, &format!("nothing answers on port {port} yet")).await,
+    let Some(mut vm) = connect(ip, port).await else {
+        return refuse(&kiln, &req, &format!("nothing answers on port {port} yet")).await;
     };
     let mut conn = match kiln.attach(req.session).await {
         Ok(conn) => conn,
@@ -63,6 +62,20 @@ async fn tcp(kiln: Kiln, reconciler: Arc<Mutex<Reconciler>>, req: ConsoleRequest
     tracing::info!(instance = %id, port, "tunnel opened");
     let result = tokio::io::copy_bidirectional(&mut conn, &mut vm).await;
     tracing::info!(instance = %id, port, ?result, "tunnel closed");
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn connect(ip: IpAddr, port: u16) -> Option<tokio::net::TcpStream> {
+    tokio::time::timeout(CONNECT, tokio::net::TcpStream::connect(SocketAddr::new(ip, port))).await.ok()?.ok()
+}
+
+/// Through `ingot net`, which macOS lets reach the VMs (reach.rs).
+#[cfg(target_os = "macos")]
+async fn connect(ip: IpAddr, port: u16) -> Option<tokio::net::UnixStream> {
+    let IpAddr::V4(ip) = ip else { return None };
+    let to = std::net::SocketAddrV4::new(ip, port);
+    let socket = std::path::Path::new(crate::reach::SOCKET);
+    tokio::time::timeout(CONNECT * 2, crate::reach::connect(socket, to)).await.ok()?.ok()
 }
 
 /// Older bridged VMs report their own addresses, so a guest controls them.

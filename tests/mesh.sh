@@ -71,11 +71,16 @@ vm nb 2 vb 10.42.2.10 vnet0
 vm nc 3 vc 10.42.3.10 vnet0
 vm nc 3 vh 10.42.3.11 vnet1
 
-# Start each node's helper; each makes its own key.
+# Start each node's helper; each makes its own key. Apart, like separate
+# machines: helpers whose 2-second checks line up switch paths in the same
+# instant, their handshakes cross, and in one kernel WireGuard's retries
+# cross again, since its jitter is lost in the kernel's coarse timers.
+# Separate machines don't share timers. 0.7 s, so no two checks line up.
 for n in na nb nc; do
   mkdir -p "$tmp/$n"
   COPPER_NET_RUN="$tmp/$n" COPPER_NET_KEYS="$tmp/$n/keys" on "$n" "$ingot" net --state-dir "$tmp/$n" >"$tmp/$n/log" 2>&1 &
   helpers="$helpers $!"
+  sleep 0.7
 done
 key() {
   for _ in $(seq 50); do

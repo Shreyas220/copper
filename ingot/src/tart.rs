@@ -64,6 +64,14 @@ impl Tart {
     fn seed_path(&self, id: InstanceId) -> PathBuf {
         self.disks.dir.join(format!("{id}-seed.iso"))
     }
+    /// Where the seed's files gather before hdiutil makes them an ISO.
+    fn stage_path(&self, id: InstanceId) -> PathBuf {
+        self.disks.dir.join(format!("{id}-seed"))
+    }
+    /// What `tart run` prints.
+    fn log_path(&self, id: InstanceId) -> PathBuf {
+        self.disks.dir.join(format!("{id}.log"))
+    }
     fn label(id: InstanceId) -> String {
         format!("com.copper.vm.{id}")
     }
@@ -105,7 +113,7 @@ impl Tart {
         if path.exists() {
             return Ok(path);
         }
-        let stage = self.disks.dir.join(format!("{}-seed", inst.id));
+        let stage = self.stage_path(inst.id);
         std::fs::create_dir_all(&stage)?;
         std::fs::write(stage.join("user-data"), user_data_yaml(&inst.name, &inst.spec))?;
         std::fs::write(stage.join("meta-data"), format!("instance-id: {}\nlocal-hostname: {}\n", inst.id, serde_json::to_string(&inst.name)?))?;
@@ -150,7 +158,7 @@ impl Tart {
 </plist>
 "#,
             label = Self::label(id),
-            log = xml_escape(&self.disks.dir.join(format!("{id}.log")).to_string_lossy()),
+            log = xml_escape(&self.log_path(id).to_string_lossy()),
         )
     }
 }
@@ -232,11 +240,19 @@ impl Hypervisor for Tart {
             run(Command::new("tart").args(["delete", &name_of(id)]))?;
             tracing::info!(instance = %id, "vm deleted");
         }
+        // The seed, and what making it or running the VM left behind.
         let seed = self.seed_path(id);
-        match std::fs::remove_file(&seed) {
+        for path in [seed.with_extension("tmp.iso"), self.log_path(id), seed] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+            }
+        }
+        match std::fs::remove_dir_all(self.stage_path(id)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("removing {}", seed.display())),
+            Err(e) => return Err(e).with_context(|| format!("removing {}", self.stage_path(id).display())),
         }
         if self.has_storage(id) {
             bail!("storage still present after removal");
@@ -354,6 +370,26 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
         assert_eq!((json["macAddress"].as_str(), json["os"].as_str()), (Some("52:54:00:ab:cd:01"), Some("linux")), "the rest is Tart's");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removing_a_vm_leaves_none_of_its_files() {
+        let dir = crate::test_support::TempDir::new();
+        let t = Tart {
+            disks: Disks { dir: dir.path().join("disks"), images: dir.path().join("images") },
+            home: dir.path().into(),
+            uid: 501,
+            tart: "/opt/homebrew/bin/tart".into(),
+        };
+        let id = InstanceId::new_v4();
+        std::fs::create_dir_all(t.stage_path(id)).unwrap();
+        std::fs::write(t.stage_path(id).join("user-data"), "").unwrap();
+        for path in [t.seed_path(id), t.seed_path(id).with_extension("tmp.iso"), t.log_path(id)] {
+            std::fs::write(path, "").unwrap();
+        }
+        t.remove_storage(id).unwrap();
+        assert_eq!(std::fs::read_dir(&t.disks.dir).unwrap().count(), 0);
+        assert!(!t.has_storage(id));
     }
 
     #[test]

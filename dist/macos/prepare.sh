@@ -175,6 +175,12 @@ EOF
   sudo launchctl print system/com.copper.net 2>/dev/null | grep -q "state = running" \
     || die "the network helper didn't start; see /var/log/copper-net.log"
 fi
+# The helper answers the VMs' DNS, and macOS's Application Firewall drops
+# what comes in for programs that aren't Apple's or a known developer's.
+# Each build is a new program to it, so this runs every time.
+alf=/usr/libexec/ApplicationFirewall/socketfilterfw
+sudo "$alf" --add "$helper" >/dev/null
+sudo "$alf" --unblockapp "$helper" >/dev/null
 
 # launchd has no equivalent of systemd's RestartPreventExitStatus, so a wrapper
 # turns ingot's "stop, don't restart" exit code 78 into a clean exit, which

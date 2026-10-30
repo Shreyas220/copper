@@ -112,7 +112,7 @@ One architecture wherever a node is: on the home router, or anywhere else on the
 ### Between VMs
 - Every packet goes through its host. VM ports on the node's bridge are isolated (libvirt's `<port isolated='yes'/>`, a `private` member on macOS), so VMs can't reach each other directly even with crafted frames. The host's routing and firewall see all VM traffic, whichever node the other end is on.
 - Projects are walls. A node forwards traffic into one of its VMs only from VMs in the same project. Every VM can reach the internet, and nothing else private: not the home LAN, the tailnet, link-local, or the nodes themselves except DNS. There's no broadcast or multicast between VMs.
-- Source addresses can be trusted: libvirt's `clean-traffic` filter pins each VM to its own address and MAC, and between nodes WireGuard only accepts a node's own /24 from its key.
+- Source addresses can be trusted: libvirt's `clean-traffic` filter pins each VM to its own address and MAC, and between nodes WireGuard only accepts a node's own /24 from its key. Not yet on macOS: nothing in copper pins a Tart VM to its address, so unless macOS's VM network stops it (untested), a VM could send as another VM on the same Mac, other projects included. WireGuard still keeps it inside the Mac's /24.
 - Names: ingot answers DNS on each gateway. `<vm>.<project>.copper` and, inside the project, plain `<vm>` resolve to the VM's address; everything else is forwarded to the node's own resolver. A VM only gets answers about its own project. Port 53 on the gateway is redirected to ingot, so any OS and, later, containers use it unchanged.
 
 ### Between nodes: the mesh

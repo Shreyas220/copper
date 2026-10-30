@@ -27,6 +27,7 @@ One architecture wherever a node is: on the home router or anywhere on the tailn
 - [x] A root helper (`ingot net`) applies each node's network from a file ingot writes, replacing the `copper-net` script.
 - [x] The mesh: WireGuard between every pair of nodes, LAN first, the tailnet when the LAN doesn't answer; the Nodes page shows each peer's path. Tested with three nodes in namespaces in CI, and between the laptop and the Mac mini over their LAN and, with the LAN blocked, the tailnet.
 - [x] Tart nodes on copper networks: the Mac's VM network on the node's /24, pf rules, private ports, `wireguard-go`, and the root helper answering DNS and carrying tunnels where macOS keeps ingot from its VMs.
+- [ ] Pin Mac VMs to their addresses, as `clean-traffic` does on Linux: first test whether a Tart VM can send as another VM on the same Mac, then filter each VM's `vmenet` port by its MAC and address.
 - [ ] Check whether a peer's LAN answers without dropping the path that works. Today a probe switches over and waits for a handshake, so where another device answers at a peer's LAN address the two nodes lose each other for about 10 s at each probe, every 30 minutes once backed off.
 - [ ] A jump host in kiln, so plain `ssh` reaches a VM by name without cu.
 
